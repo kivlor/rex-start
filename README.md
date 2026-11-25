@@ -23,10 +23,37 @@ Mac/iOS over SSH/Tailscale, and vice versa.
 - [x] Render the stream through `libghostty` (`crates/rex-terminal`: restore
       snapshot, feed PTY bytes, apply rex1 messages by nonce; `replay` binary
       renders captured streams offline)
-- [ ] GPUI window: single pane → splits/zoom → session picker
+- [x] GPUI window (`crates/rex-app`): single pane → splits/zoom → session
+      picker; server owns layout (`session_view_changed` → `session.view`),
+      `session.new_split` / `session.zoom_block` bound to keys, closing the
+      window leaves sessions running
 - [ ] Key input through `client.key` (so `init.lua` bindings see keys first)
 - [ ] Resize ownership (`session.own_block`) — claim blocks, request grids
 - [ ] Reconnect/resume (control reconnect token; data RESUME with byte count)
+
+## Running the app
+
+```sh
+rex server start
+WAYLAND_DISPLAY=wayland-0 cargo run -p rex-app -- -s <label>   # attach that session
+WAYLAND_DISPLAY=wayland-0 cargo run -p rex-app -- --new-session  # make one and open it
+REX_APP_DEBUG=1 … # protocol/render progress on stderr (frames, view refreshes)
+```
+
+Keys: `ctrl-alt-right` horizontal split, `ctrl-alt-down` vertical split,
+`ctrl-alt-z` zoom/unzoom, `ctrl-alt-p` session picker (up/down, enter to
+switch, `n` for a new session, esc to close). Splits and zoom go through
+the server's ordered methods, one call at a time; layout geometry always
+comes from the server. Closing the window only disconnects — sessions
+and their programs keep running.
+
+Building `rex-app` needs GPUI's Linux system libraries. On Fedora install
+the development packages with
+`sudo dnf install libxcb-devel libxkbcommon-devel libxkbcommon-x11-devel`
+(the runtime loaders are usually already present). Build also requires
+Zig 0.17, pinned via `mise` (see `mise.toml`). One more caveat: `libc` ≥ 0.2.190
+removed `ENOATTR`, which breaks `xattr 0.2.3` (a GPUI dependency) —
+the lockfile pins `libc 0.2.189` / `mio 1.2.4` until gpui updates.
 
 ## Running the probe
 
