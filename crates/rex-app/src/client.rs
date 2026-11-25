@@ -462,10 +462,7 @@ impl Actor {
         });
         match self.rpc.call("client.keymap", payload).await {
             Ok(keymap) => {
-                let lua_bindings = keymap["bindings"]
-                    .as_array()
-                    .map(|b| b.len())
-                    .unwrap_or(0);
+                let lua_bindings = keymap["bindings"].as_array().map(|b| b.len()).unwrap_or(0);
                 debug!("keymap declared: {lua_bindings} resolved bindings");
             }
             Err(error) => {
@@ -894,7 +891,9 @@ mod tests {
         assert_eq!(rex_conn::chunk_utf8("", 100).count(), 0);
         let huge = "x".repeat(10_000);
         assert_eq!(
-            rex_conn::chunk_utf8(&huge, 1024).map(str::len).sum::<usize>(),
+            rex_conn::chunk_utf8(&huge, 1024)
+                .map(str::len)
+                .sum::<usize>(),
             10_000
         );
         assert!(rex_conn::chunk_utf8(&huge, 1024).all(|c| c.len() <= 1024));

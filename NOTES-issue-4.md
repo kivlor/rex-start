@@ -160,3 +160,30 @@ end)
 - Cleanup: killed keybind/key-binding-fired, keyprobe, keytest-* sessions;
   no probe-stream-*.bin were created (only the two committed fixtures
   remain, untouched).
+
+## Step 5 — final checks (all green)
+
+- `cargo fmt --all -- --check`: pass (after one `cargo fmt --all` run; the
+  diff was pure reflow of code added in step 3).
+- `cargo clippy --workspace --all-targets -- -D warnings`: pass (one fix:
+  elide lifetimes on `chunk_utf8`).
+- `cargo test --workspace`: 27 tests pass, 0 fail (13 in rex-app incl. the
+  6 new keystroke-mapping tests, 3 chunk_utf8 tests, plus the pre-existing
+  view/stream/probe suites).
+- Final GUI smoke with the new init.lua present: "keymap declared: 6
+  resolved bindings" (5 app defaults + init.lua's ctrl+a k), window opens,
+  first frame 80x24, no panics; test session killed after.
+
+## Left for #5 / #6
+
+- Function keys (f1-f12), keypad keys, and bracketed-paste mode
+  (`unidentified` text chunks arrive as if typed; programs that behave
+  differently on paste — e.g. multiline guard in shells — need the
+  bracketed-paste escape, a `block.event` escape hatch).
+- Mouse events ride block input per the issue; not wired.
+- Keymap-driven client routing: the app could fetch the keymap and honor
+  init.lua overrides of app.* actions (today init.lua rebindings of
+  ctrl-alt-* reach the server but the app still handles them locally
+  first).
+- `prefix` (key sequences) is plumbed through ClientCmd but the UI never
+  builds one; it exists for when the app starts waiting on sequences.

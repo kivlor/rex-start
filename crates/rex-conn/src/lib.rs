@@ -21,7 +21,7 @@ use tokio_tungstenite::WebSocketStream;
 /// character: paste text is UTF-8, and a chunk boundary inside a code
 /// point would send invalid bytes to the terminal. Used to keep each
 /// `client.key` request under the welcome's `limits.max_message_bytes`.
-pub fn chunk_utf8<'a>(text: &'a str, max_bytes: usize) -> impl Iterator<Item = &'a str> {
+pub fn chunk_utf8(text: &str, max_bytes: usize) -> impl Iterator<Item = &str> {
     let mut rest = text;
     std::iter::from_fn(move || {
         if rest.is_empty() {

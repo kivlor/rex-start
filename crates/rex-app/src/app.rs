@@ -242,9 +242,7 @@ impl RexApp {
                         let selected = self
                             .session_id
                             .as_ref()
-                            .and_then(|id| {
-                                self.sessions.iter().position(|s| &s.session_id == id)
-                            })
+                            .and_then(|id| self.sessions.iter().position(|s| &s.session_id == id))
                             .unwrap_or(0);
                         self.picker = Some(selected);
                     } else {
@@ -261,10 +259,7 @@ impl RexApp {
         }
         // Paste: gpui 0.2 exposes no paste event, so ctrl+v reads the
         // clipboard and sends it as chunked client.key text.
-        if keystroke.modifiers.control
-            && !keystroke.modifiers.alt
-            && keystroke.key == "v"
-        {
+        if keystroke.modifiers.control && !keystroke.modifiers.alt && keystroke.key == "v" {
             let text = cx
                 .read_from_clipboard()
                 .and_then(|item| item.text())
@@ -657,19 +652,19 @@ mod tests {
             assert_eq!(event.key, protocol_name);
             assert_eq!(event.text, "");
         }
-        let event =
-            keystroke_to_key_event(&keystroke("enter", None, Default::default())).expect("mappable");
+        let event = keystroke_to_key_event(&keystroke("enter", None, Default::default()))
+            .expect("mappable");
         assert_eq!(event.key, "enter");
         assert_eq!(event.unshifted_codepoint, 13);
     }
 
     #[test]
     fn digits_and_punctuation_map_to_w3c_codes() {
-        let event =
-            keystroke_to_key_event(&keystroke("7", Some("7"), Default::default())).expect("mappable");
+        let event = keystroke_to_key_event(&keystroke("7", Some("7"), Default::default()))
+            .expect("mappable");
         assert_eq!(event.key, "digit_7");
-        let event =
-            keystroke_to_key_event(&keystroke("-", Some("-"), Default::default())).expect("mappable");
+        let event = keystroke_to_key_event(&keystroke("-", Some("-"), Default::default()))
+            .expect("mappable");
         assert_eq!(event.key, "minus");
         assert_eq!(event.text, "-");
     }
