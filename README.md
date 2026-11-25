@@ -32,7 +32,7 @@ Mac/iOS over SSH/Tailscale, and vice versa.
 
 ```sh
 rex server start            # personal server, idempotent (sessions run as you)
-cargo run --release -- --command pi --label pi-demo --seconds 10
+cargo run -p probe --release -- --command pi --label pi-demo --seconds 10
 rex ls                      # session stays alive after the probe exits
 rex capture -s pi-demo      # view the pane from the CLI
 rex kill pi-demo            # end it (kill takes labels positionally)
