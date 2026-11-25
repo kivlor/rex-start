@@ -17,25 +17,48 @@ use tokio_tungstenite::tungstenite::http::Request;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-/// Splits `text` into chunks of at most `max_bytes` without breaking a
-/// character: paste text is UTF-8, and a chunk boundary inside a code
-/// point would send invalid bytes to the terminal. Used to keep each
-/// `client.key` request under the welcome's `limits.max_message_bytes`.
-pub fn chunk_utf8(text: &str, max_bytes: usize) -> impl Iterator<Item = &str> {
+/// Per-character encoded length of `c` inside a serde_json string
+/// literal: `"`, `\\` and the two short escapes (`\n`, `\t`, `\r`,
+/// `\b`, `\f`) cost 2 bytes, other control chars (< 0x20) become a
+/// 6-byte `\u00XX`, and everything else costs its UTF-8 byte length.
+const fn json_escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\t' | '\r' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Splits `text` into chunks whose JSON string-literal encoding stays
+/// within `max_json_bytes`, never breaking a character. Paste goes out
+/// through `client.key` as JSON, and serde_json escapes `"`, `\\` and
+/// control characters — sizing chunks by raw UTF-8 bytes would let a
+/// newline-heavy payload expand past the welcome's
+/// `limits.max_message_bytes` and close the control connection (1009).
+/// This counts each character at its escaped length instead. A single
+/// character wider than the whole budget still goes out alone: cutting
+/// it would loop forever, and one code point never breaks a budget
+/// that fits a request by much.
+pub fn chunk_json_safe(text: &str, max_json_bytes: usize) -> impl Iterator<Item = &str> {
     let mut rest = text;
     std::iter::from_fn(move || {
-        if rest.is_empty() {
-            return None;
+        let first = rest.chars().next()?;
+        // Greedy: keep appending characters while the chunk's encoded
+        // length (plus the surrounding quotes) stays within budget.
+        let mut used = 2; // opening + closing quote of the JSON string
+        let mut end = 0;
+        for c in rest.chars() {
+            let cost = json_escaped_len(c);
+            if used + cost > max_json_bytes && end > 0 {
+                break;
+            }
+            used += cost;
+            end += c.len_utf8();
         }
-        let mut end = rest.len().min(max_bytes);
-        while end > 0 && !rest.is_char_boundary(end) {
-            end -= 1;
-        }
-        // A single character wider than max_bytes still goes out whole:
-        // the caller guarantees max_bytes fits a request, and one code
-        // point never breaks that by much. Cutting it would loop forever.
+        // A single character larger than the whole budget goes out
+        // alone rather than looping forever on empty chunks.
         if end == 0 {
-            end = rest.chars().next().map(char::len_utf8).unwrap_or(0);
+            end = first.len_utf8();
         }
         let (chunk, tail) = rest.split_at(end);
         rest = tail;
@@ -242,5 +265,65 @@ mod tests {
         assert_eq!(check_ticket(vec![0u8; 16]).unwrap().len(), 16);
         assert!(check_ticket(Vec::new()).is_err());
         assert!(check_ticket(vec![0u8; 17]).is_err());
+    }
+
+    #[test]
+    fn chunk_json_safe_splits_on_char_boundaries() {
+        let text = "\u{e9}abc\u{1f600}def";
+        let chunks: Vec<&str> = chunk_json_safe(text, 5).collect();
+        assert_eq!(chunks, vec!["\u{e9}a", "bc", "\u{1f600}", "def"]);
+    }
+
+    #[test]
+    fn chunk_json_safe_empty_and_huge() {
+        assert_eq!(chunk_json_safe("", 100).count(), 0);
+        let huge = "x".repeat(10_000);
+        assert_eq!(
+            chunk_json_safe(&huge, 1024).map(str::len).sum::<usize>(),
+            10_000
+        );
+        assert!(chunk_json_safe(&huge, 1024).all(|c| c.len() <= 1024));
+    }
+
+    #[test]
+    fn chunk_json_safe_wide_char_in_narrow_chunk() {
+        // A single character wider than the chunk still goes out whole
+        // rather than looping on empty chunks.
+        let chunks: Vec<&str> = chunk_json_safe("a\u{1f600}b", 4).collect();
+        assert_eq!(chunks, vec!["a", "\u{1f600}", "b"]);
+    }
+
+    #[test]
+    fn chunk_json_safe_counts_escapes_not_raw_bytes() {
+        // Newlines cost 2 bytes each in JSON, so a 4-byte "\n\n" chunk
+        // with a 6-byte budget is full, while 6 plain 'a's fit in 8.
+        let chunks: Vec<&str> = chunk_json_safe("\n\n\n", 6).collect();
+        assert_eq!(chunks, vec!["\n\n", "\n"]);
+        let chunks: Vec<&str> = chunk_json_safe("aaaaaaaa", 8).collect();
+        assert_eq!(chunks, vec!["aaaaaa", "aa"]);
+    }
+
+    #[test]
+    fn chunk_json_safe_encoded_length_within_budget() {
+        // The property the paste path depends on: every chunk's JSON
+        // string encoding (quotes included) stays within the budget,
+        // even for control-char-heavy input that raw-byte chunking
+        // would oversell by up to 6x.
+        let mut text = String::new();
+        for i in 0..20_000 {
+            text.push(if i % 2 == 0 { '\n' } else { 'x' });
+            if i % 7 == 3 {
+                text.push('\u{1}');
+            }
+        }
+        assert!(text.len() > 10_000);
+        for chunk in chunk_json_safe(&text, 4096) {
+            let encoded = serde_json::to_string(chunk).unwrap();
+            assert!(
+                encoded.len() <= 4096,
+                "chunk encoded to {} bytes > 4096",
+                encoded.len()
+            );
+        }
     }
 }

@@ -5,6 +5,9 @@
 //! mise exec -- cargo run -p rex-conn --example client_key
 //! # force small paste chunks to exercise the chunking path:
 //! REX_KEY_CHUNK_BYTES=8192 mise exec -- cargo run -p rex-conn --example client_key
+//! # newline-heavy paste: each byte escapes to 2 JSON bytes, the case
+//! # raw-byte chunking sent oversized (1009):
+//! REX_PASTE_NEWLINES=614400 mise exec -- cargo run -p rex-conn --example client_key
 //! ```
 //!
 //! It creates a session, runs `cat` in its shell, and verifies each kind of
@@ -131,21 +134,38 @@ async fn main() -> Result<()> {
     println!("PASS plain text (multi-char, one call)");
 
     // ---- multi-KB paste, chunked under max_message_bytes ----
-    // Default chunking keeps one chunk under the server's limit; a small
-    // REX_KEY_CHUNK_BYTES forces several chunks to exercise the path.
+    // Default chunking keeps one chunk's JSON under the server's limit;
+    // a small REX_KEY_CHUNK_BYTES forces several chunks to exercise the
+    // path. The budget is the chunk's *encoded* size: serde_json escapes
+    // control characters, so newline-heavy paste expands in JSON.
     let chunk_bytes = std::env::var("REX_KEY_CHUNK_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| (max_message_bytes.saturating_sub(1024) as usize).max(1024));
-    let lines: Vec<String> = (0..5000).map(|i| format!("paste-line-{i:05}")).collect();
-    let paste = lines.join("\n");
+    let paste_end_marker;
+    let paste = match std::env::var("REX_PASTE_NEWLINES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        // Newline-heavy paste: every byte escapes to 2 JSON bytes, the
+        // regression case where raw-byte chunking oversized the request.
+        Some(nl) => {
+            paste_end_marker = "paste-newlines-done".to_string();
+            format!("{}\n{}\n", "\n".repeat(nl), paste_end_marker)
+        }
+        None => {
+            paste_end_marker = "paste-line-04999".to_string();
+            let lines: Vec<String> = (0..5000).map(|i| format!("paste-line-{i:05}")).collect();
+            lines.join("\n")
+        }
+    };
     println!(
-        "pasting {} bytes in chunks of {}",
+        "pasting {} bytes in chunks of up to {} JSON bytes",
         paste.len(),
         chunk_bytes.min(paste.len())
     );
     let mut chunks = 0;
-    for chunk in rex_conn::chunk_utf8(&paste, chunk_bytes) {
+    for chunk in rex_conn::chunk_json_safe(&paste, chunk_bytes) {
         chunks += 1;
         let handled = send_key(
             &mut rpc,
@@ -159,9 +179,17 @@ async fn main() -> Result<()> {
     }
     println!("sent {chunks} paste chunks");
     send_key(&mut rpc, &session_id, key_event("enter", "", "", 13)).await?;
-    wait_output().await;
-    let text = screen(&mut rpc, &session_id, &block_id).await?;
-    if !text.contains("paste-line-04999") {
+    // cat can take a while to echo a very large paste, so poll for the
+    // end marker instead of one fixed sleep.
+    let mut text = String::new();
+    for _ in 0..120 {
+        wait_output().await;
+        text = screen(&mut rpc, &session_id, &block_id).await?;
+        if text.contains(&paste_end_marker) {
+            break;
+        }
+    }
+    if !text.contains(&paste_end_marker) {
         bail!(
             "paste did not arrive whole; screen tail:\n{}",
             text.chars()

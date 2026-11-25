@@ -500,11 +500,14 @@ impl Actor {
     }
 
     /// Paste: `client.key` with a chunk of text in each call (the server
-    /// accepts multi-character `text` — verified live), chunks sized so
-    /// each request's JSON stays under `limits.max_message_bytes`; an
-    /// oversized request would close the connection. 1 KiB of margin for
-    /// the JSON envelope, floored at 1 KiB in case a server advertises
-    /// the bare 64 KiB minimum.
+    /// accepts multi-character `text` — verified live), chunks sized by
+    /// their **JSON-encoded** length so each request stays under the
+    /// welcome's `limits.max_message_bytes`: serde_json escapes `"`,
+    /// `\\` and control characters, so a newline-heavy paste expands
+    /// past the limit if chunks are sized by raw bytes and the server
+    /// closes the connection (1009). 1 KiB of margin for the JSON
+    /// envelope, floored at 1 KiB in case a server advertises the bare
+    /// 64 KiB minimum.
     async fn paste(&mut self, text: &str) -> Result<()> {
         let session_id = self
             .session_id()
@@ -513,7 +516,7 @@ impl Actor {
         let margin = 1024;
         let chunk_bytes = (self.max_message_bytes.saturating_sub(margin) as usize).max(1024);
         let mut sent = 0;
-        for chunk in rex_conn::chunk_utf8(text, chunk_bytes) {
+        for chunk in rex_conn::chunk_json_safe(text, chunk_bytes) {
             let key = KeyEvent {
                 key: "unidentified".into(),
                 mods: String::new(),
@@ -879,38 +882,8 @@ async fn stream_block(
 }
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn chunk_utf8_splits_on_char_boundaries() {
-        let text = "\u{e9}abc\u{1f600}def";
-        let chunks: Vec<&str> = rex_conn::chunk_utf8(text, 3).collect();
-        assert_eq!(chunks, vec!["\u{e9}a", "bc", "\u{1f600}", "def"]);
-    }
-
-    #[test]
-    fn chunk_utf8_empty_and_huge() {
-        assert_eq!(rex_conn::chunk_utf8("", 100).count(), 0);
-        let huge = "x".repeat(10_000);
-        assert_eq!(
-            rex_conn::chunk_utf8(&huge, 1024)
-                .map(str::len)
-                .sum::<usize>(),
-            10_000
-        );
-        assert!(rex_conn::chunk_utf8(&huge, 1024).all(|c| c.len() <= 1024));
-    }
-
-    #[test]
-    fn chunk_utf8_wide_char_in_narrow_chunk() {
-        // A single character wider than the chunk still goes out whole
-        // rather than looping on empty chunks.
-        let chunks: Vec<&str> = rex_conn::chunk_utf8("a\u{1f600}b", 2).collect();
-        assert_eq!(chunks, vec!["a", "\u{1f600}", "b"]);
-    }
-}
-
-#[cfg(test)]
-mod tests {
     use super::revision_is_newer;
+    use serde_json::json;
 
     #[test]
     fn revision_must_be_strictly_newer() {
@@ -918,5 +891,66 @@ mod tests {
         assert!(revision_is_newer(3, Some(2)));
         assert!(!revision_is_newer(2, Some(2)));
         assert!(!revision_is_newer(1, Some(2)));
+    }
+
+    #[test]
+    fn chunk_json_safe_splits_on_char_boundaries() {
+        let text = "\u{e9}abc\u{1f600}def";
+        let chunks: Vec<&str> = rex_conn::chunk_json_safe(text, 5).collect();
+        assert_eq!(chunks, vec!["\u{e9}a", "bc", "\u{1f600}", "def"]);
+    }
+
+    #[test]
+    fn chunk_json_safe_empty_and_huge() {
+        assert_eq!(rex_conn::chunk_json_safe("", 100).count(), 0);
+        let huge = "x".repeat(10_000);
+        assert_eq!(
+            rex_conn::chunk_json_safe(&huge, 1024)
+                .map(str::len)
+                .sum::<usize>(),
+            10_000
+        );
+        assert!(rex_conn::chunk_json_safe(&huge, 1024).all(|c| c.len() <= 1024));
+    }
+
+    #[test]
+    fn chunk_json_safe_wide_char_in_narrow_chunk() {
+        // A single character wider than the chunk still goes out whole
+        // rather than looping on empty chunks.
+        let chunks: Vec<&str> = rex_conn::chunk_json_safe("a\u{1f600}b", 4).collect();
+        assert_eq!(chunks, vec!["a", "\u{1f600}", "b"]);
+    }
+
+    #[test]
+    fn chunk_json_safe_paste_stays_within_budget() {
+        // The regression from review: sizing paste chunks by raw UTF-8
+        // bytes let a newline-heavy payload expand ~2x in JSON and
+        // blow past limits.max_message_bytes, closing the control
+        // connection (1009). Every chunk's JSON encoding must stay
+        // within the budget — proven for a control-char-heavy input.
+        let chunk_budget = (1024 * 1024usize).saturating_sub(1024); // 1 MiB server, 1 KiB envelope margin
+        let mut text = String::new();
+        for _ in 0..600 * 1024 {
+            text.push('\n'); // ~600 KiB of newlines: 2x expansion in JSON
+        }
+        for i in 0..20_000 {
+            text.push(if i % 2 == 0 { '\n' } else { 'x' });
+            if i % 7 == 3 {
+                text.push('\u{1}'); // 6x expansion as \u0001
+            }
+        }
+        let mut chunks = 0;
+        for chunk in rex_conn::chunk_json_safe(&text, chunk_budget) {
+            chunks += 1;
+            let payload = json!(chunk);
+            assert!(
+                payload.to_string().len() <= chunk_budget,
+                "chunk JSON encoded to {} > budget {}",
+                payload.to_string().len(),
+                chunk_budget
+            );
+        }
+        assert!(chunks >= 2, "expected multiple chunks");
+        assert_eq!(text.len(), 600 * 1024 + 20_000 + 2857); // newlines + xs/controls
     }
 }
