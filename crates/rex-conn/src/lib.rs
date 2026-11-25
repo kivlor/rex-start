@@ -108,13 +108,23 @@ pub async fn send_json(ws: &mut Ws, v: &Value) -> Result<()> {
     Ok(ws.send(Message::Text(v.to_string().into())).await?)
 }
 
-/// Read the next text message as JSON.
+/// Read the next text message as JSON, skipping websocket control
+/// frames: the server pings every 120s (tungstenite answers them as it
+/// reads them), and a ping arriving between request and response must
+/// not fail an RPC in flight.
 pub async fn recv_json(ws: &mut Ws) -> Result<Value> {
-    match ws.next().await {
-        Some(Ok(Message::Text(s))) => Ok(serde_json::from_str(&s)?),
-        Some(Ok(m)) => bail!("unexpected control message: {m:?}"),
-        Some(Err(e)) => Err(e.into()),
-        None => bail!("connection closed"),
+    loop {
+        match ws.next().await {
+            Some(Ok(Message::Text(s))) => return Ok(serde_json::from_str(&s)?),
+            Some(Ok(Message::Close(frame))) => bail!("connection closed: {frame:?}"),
+            Some(Ok(Message::Binary(b))) => {
+                bail!("unexpected binary message ({} bytes)", b.len())
+            }
+            // Ping/Pong and raw frames: control traffic, not JSON.
+            Some(Ok(_)) => continue,
+            Some(Err(e)) => return Err(e.into()),
+            None => bail!("connection closed"),
+        }
     }
 }
 
@@ -123,16 +133,29 @@ pub async fn recv_json(ws: &mut Ws) -> Result<Value> {
 /// `client` becomes the hello's `client` field, such as
 /// `{"kind": "cli", "name": "probe", "version": "0.1.0"}`.
 /// Returns the welcome message.
-pub async fn hello(mut ws: Ws, client: Value) -> Result<(Ws, Value)> {
-    send_json(
-        &mut ws,
-        &json!({
-            "type": "hello",
-            "api_revision": 19,
-            "client": client
-        }),
-    )
-    .await?;
+pub async fn hello(ws: Ws, client: Value) -> Result<(Ws, Value)> {
+    hello_with_token(ws, client, None).await
+}
+
+/// The hello handshake, optionally carrying the `reconnect_token` from
+/// the last welcome to continue that client ("Reconnecting" in the API
+/// doc). A good token keeps the client id and sets `resumed: true` in
+/// the new welcome; an unknown or expired one silently starts a new
+/// client. Never log the token or the welcome's `client` object.
+pub async fn hello_with_token(
+    mut ws: Ws,
+    client: Value,
+    reconnect_token: Option<&str>,
+) -> Result<(Ws, Value)> {
+    let mut hello = json!({
+        "type": "hello",
+        "api_revision": 19,
+        "client": client
+    });
+    if let Some(token) = reconnect_token {
+        hello["reconnect_token"] = Value::from(token);
+    }
+    send_json(&mut ws, &hello).await?;
     let welcome = recv_json(&mut ws).await?;
     if welcome["type"] != "welcome" {
         bail!("expected welcome, got: {welcome}");
@@ -226,21 +249,166 @@ fn check_ticket(bytes: Vec<u8>) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Opens a terminal data connection: WS at /api/data, binary HELLO with the
-/// ticket, WELCOME back. Returns the stream and its channel nonce, which
-/// rex1 APC messages must carry.
-pub async fn open_data(path: &str, ticket: &[u8]) -> Result<(Ws, u64)> {
+/// A 16-byte data-connection reconnect token. The WELCOME carries a
+/// new one each time; only the latest is good for a RESUME. It is a
+/// bearer secret, so `Debug` never shows it ("Never log it").
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ReconnectToken([u8; 16]);
+
+impl std::fmt::Debug for ReconnectToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReconnectToken([redacted; 16 bytes])")
+    }
+}
+
+impl ReconnectToken {
+    /// The token from a WELCOME's bytes 1..=16 (the `0x81` prefix at 0).
+    fn from_welcome(welcome: &[u8]) -> Result<Self> {
+        Ok(Self(
+            welcome
+                .get(1..17)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| anyhow!("WELCOME too short for a reconnect token"))?,
+        ))
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// What a data connection's handshake answered: the WELCOME's new
+/// reconnect token, retention window, and channel nonce — or the
+/// REJECT's one-byte reason.
+#[derive(Debug)]
+pub enum DataHandshake {
+    Welcome(Box<Ws>, DataWelcome),
+    Rejected(u8),
+}
+
+/// The parsed 32-byte data WELCOME. Its `Debug` is safe: the token
+/// redacts itself.
+#[derive(Clone, Copy, Debug)]
+pub struct DataWelcome {
+    pub token: ReconnectToken,
+    /// How long the server keeps the stream for a resume, in ms.
+    pub retention_ms: u32,
+    /// The channel nonce rex1 messages must carry; never zero, and the
+    /// same across resumes of one stream.
+    pub nonce: u64,
+}
+
+/// Sends `msg` (HELLO or RESUME) on a fresh `/api/data` socket and reads
+/// the one-binary answer: WELCOME (with a NEW token — keep the newest)
+/// or REJECT (the server then closes with `data handshake rejected`).
+async fn handshake(path: &str, msg: Vec<u8>) -> Result<DataHandshake> {
     let mut ws = connect(path, "/api/data", "rex.data.terminal.v1").await?;
-    let mut hello = vec![0x01u8];
-    hello.extend_from_slice(ticket);
-    ws.send(Message::Binary(hello.into())).await?;
-    let welcome = match ws.next().await {
-        Some(Ok(Message::Binary(b))) if b.len() == 32 && b[0] == 0x81 => b,
-        Some(other) => bail!("bad data WELCOME: {other:?}"),
-        None => bail!("data connection closed before WELCOME"),
-    };
-    let nonce = u64::from_le_bytes(welcome[24..32].try_into().unwrap());
-    Ok((ws, nonce))
+    ws.send(Message::Binary(msg.into())).await?;
+    match ws.next().await {
+        Some(Ok(Message::Binary(b))) if b.len() == 32 && b[0] == 0x81 => {
+            Ok(DataHandshake::Welcome(
+                Box::new(ws),
+                DataWelcome {
+                    token: ReconnectToken::from_welcome(&b)?,
+                    retention_ms: u32::from_le_bytes(b[20..24].try_into().unwrap()),
+                    nonce: u64::from_le_bytes(b[24..32].try_into().unwrap()),
+                },
+            ))
+        }
+        Some(Ok(Message::Binary(b))) if b.len() == 2 && b[0] == 0x82 => {
+            Ok(DataHandshake::Rejected(b[1]))
+        }
+        Some(other) => bail!("bad data handshake answer: {other:?}"),
+        None => bail!("data connection closed during handshake"),
+    }
+}
+
+/// Opens a terminal data connection: WS at /api/data, binary HELLO with
+/// the ticket, WELCOME back. The WELCOME's reconnect token starts the
+/// stream's resume state; every later WELCOME replaces it.
+pub async fn open_data(path: &str, ticket: &[u8]) -> Result<(Ws, DataWelcome)> {
+    let mut msg = vec![0x01u8];
+    msg.extend_from_slice(ticket);
+    match handshake(path, msg).await? {
+        DataHandshake::Welcome(ws, welcome) => Ok((*ws, welcome)),
+        DataHandshake::Rejected(reason) => {
+            bail!("data HELLO rejected: reason 0x{reason:02x}")
+        }
+    }
+}
+
+/// A 25-byte RESUME: `0x02`, the 16 bytes of the latest reconnect
+/// token, then the exact number of stream bytes received so far as a
+/// u64 little-endian. A resume needs no ticket and no control
+/// connection.
+fn encode_resume(token: ReconnectToken, bytes: u64) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(25);
+    msg.push(0x02);
+    msg.extend_from_slice(token.as_bytes());
+    msg.extend_from_slice(&bytes.to_le_bytes());
+    msg
+}
+
+/// Opens a new `/api/data` connection and tries to resume one stream:
+/// RESUME with the latest token and the exact byte count. On a WELCOME
+/// the stream continues from the first byte not received; on a REJECT
+/// the caller decides per the reason table (0x01/0x03/0x05 → start over
+/// with a new ticket; 0x02 → RESUME again; anything else → failure).
+pub async fn resume_data(path: &str, token: ReconnectToken, bytes: u64) -> Result<DataHandshake> {
+    handshake(path, encode_resume(token, bytes)).await
+}
+
+/// The authoritative per-stream resume state (issue #6: "keep a single
+/// authoritative counter where frames are consumed"). `bytes` counts
+/// every stream byte used, across every connection of the stream, NOT
+/// counting handshakes (the WELCOME is a handshake message, and
+/// tungstenite hands over each payload only when `next()` returns it, so
+/// what the consumer processes is exactly what was used — no
+/// read-ahead). `token` is always the newest one — each WELCOME
+/// replaces it, and only the newest resumes.
+#[derive(Debug, Default)]
+pub struct StreamResume {
+    token: Option<ReconnectToken>,
+    bytes: u64,
+}
+
+impl StreamResume {
+    /// Records a fresh WELCOME: adopts its NEW token (and returns the
+    /// nonce/retention the caller also needs from it).
+    pub fn welcomed(&mut self, welcome: DataWelcome) -> DataWelcome {
+        self.token = Some(welcome.token);
+        welcome
+    }
+
+    /// Records a fresh WELCOME from a NEW stream (the start-over path:
+    /// new ticket + HELLO): adopts its token and starts the count over,
+    /// because the new stream begins with a new snapshot.
+    pub fn restarted(&mut self, welcome: DataWelcome) -> DataWelcome {
+        self.token = Some(welcome.token);
+        self.bytes = 0;
+        welcome
+    }
+
+    /// Counts one consumed stream payload — call exactly once per
+    /// processed binary message, with its byte length.
+    pub fn consume(&mut self, len: usize) {
+        self.bytes += len as u64;
+    }
+
+    /// The exact byte count for a RESUME.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// The latest token, if any WELCOME has been seen.
+    pub fn token(&self) -> Option<ReconnectToken> {
+        self.token
+    }
+
+    /// Builds this stream's RESUME message; `None` before any WELCOME.
+    pub fn resume_message(&self) -> Option<Vec<u8>> {
+        Some(encode_resume(self.token?, self.bytes))
+    }
 }
 
 #[cfg(test)]
@@ -265,6 +433,86 @@ mod tests {
         assert_eq!(check_ticket(vec![0u8; 16]).unwrap().len(), 16);
         assert!(check_ticket(Vec::new()).is_err());
         assert!(check_ticket(vec![0u8; 17]).is_err());
+    }
+
+    /// A DataWelcome straight from a synthetic 32-byte WELCOME.
+    fn welcome_with(token_byte: u8) -> DataWelcome {
+        let mut b = vec![0x81u8];
+        b.extend(std::iter::repeat_n(token_byte, 16));
+        b.extend([0, 0, 0]);
+        b.extend(60_000u32.to_le_bytes());
+        b.extend(0xdead_beefu64.to_le_bytes());
+        DataWelcome {
+            token: ReconnectToken::from_welcome(&b).unwrap(),
+            retention_ms: u32::from_le_bytes(b[20..24].try_into().unwrap()),
+            nonce: u64::from_le_bytes(b[24..32].try_into().unwrap()),
+        }
+    }
+
+    #[test]
+    fn resume_message_is_25_bytes_le() {
+        let mut state = StreamResume::default();
+        assert!(state.resume_message().is_none());
+        state.welcomed(welcome_with(0x7f));
+        state.consume(256);
+        state.consume(3);
+        assert_eq!(state.bytes(), 259);
+        let msg = state.resume_message().unwrap();
+        assert_eq!(msg.len(), 25);
+        assert_eq!(msg[0], 0x02);
+        assert_eq!(&msg[1..17], &[0x7fu8; 16]);
+        // The count is a little-endian u64.
+        assert_eq!(u64::from_le_bytes(msg[17..25].try_into().unwrap()), 259);
+        assert_eq!(&msg[17..25], &259u64.to_le_bytes());
+    }
+
+    #[test]
+    fn stream_resume_counts_across_reconnects_and_new_tokens_win() {
+        let mut state = StreamResume::default();
+        state.welcomed(welcome_with(1));
+        let chunks = [7usize, 0, 1, 65536, 3];
+        for c in chunks {
+            state.consume(c);
+        }
+        let total: u64 = chunks.iter().map(|&c| c as u64).sum();
+        assert_eq!(state.bytes(), total);
+        // A resume's WELCOME carries a NEW token: the newest must win.
+        state.welcomed(welcome_with(2));
+        let msg = state.resume_message().unwrap();
+        assert_eq!(&msg[1..17], &[2u8; 16]);
+        // ...and the count carries over: every consumed byte, every
+        // connection.
+        assert_eq!(
+            u64::from_le_bytes(msg[17..25].try_into().unwrap()),
+            state.bytes()
+        );
+        state.consume(5);
+        assert_eq!(state.bytes(), total + 5);
+    }
+
+    #[test]
+    fn reconnect_token_debug_never_leaks() {
+        let token = welcome_with(0x41).token;
+        let printed = format!("{token:?}");
+        assert_eq!(printed, "ReconnectToken([redacted; 16 bytes])");
+        assert!(!printed.contains('A'));
+        // Deriving Debug on StreamResume must not leak either.
+        let state = StreamResume::default();
+        assert!(!format!("{state:?}").contains('A'));
+    }
+
+    #[test]
+    fn restarted_resets_the_count_for_a_new_stream() {
+        let mut state = StreamResume::default();
+        state.welcomed(welcome_with(1));
+        state.consume(1234);
+        // The start-over path: a new ticket + HELLO gives a new stream
+        // whose bytes begin at zero, with the newest token.
+        state.restarted(welcome_with(9));
+        assert_eq!(state.bytes(), 0);
+        let msg = state.resume_message().unwrap();
+        assert_eq!(&msg[1..17], &[9u8; 16]);
+        assert_eq!(u64::from_le_bytes(msg[17..25].try_into().unwrap()), 0);
     }
 
     #[test]

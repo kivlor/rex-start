@@ -27,9 +27,14 @@ Mac/iOS over SSH/Tailscale, and vice versa.
       picker; server owns layout (`session_view_changed` → `session.view`),
       `session.new_split` / `session.zoom_block` bound to keys, closing the
       window leaves sessions running
-- [ ] Key input through `client.key` (so `init.lua` bindings see keys first)
-- [ ] Resize ownership (`session.own_block`) — claim blocks, request grids
-- [ ] Reconnect/resume (control reconnect token; data RESUME with byte count)
+- [x] Key input through `client.key` (so `init.lua` bindings see keys first;
+      paste chunks sized by JSON-encoded length, under `limits.max_message_bytes`)
+- [x] Resize ownership (`session.own_block`) — claim blocks, request grids,
+      give blocks back on disown; the block follows its owner's grid
+- [x] Reconnect/resume: the control connection reconnects with the latest
+      welcome's `reconnect_token` (same client id, re-attach + re-own), and
+      data streams RESUME with an exact byte count (`crates/rex-conn/examples/resume.rs`
+      proves 3+ unclean-drop resumes and the ±1 REJECT reasons)
 
 ## Running the app
 
@@ -91,6 +96,17 @@ of `ghostty-vt-sys` compiles libghostty-vt from its official source tarball
   with revision negotiation), `zenodea/renux` (Zig/GTK4).
 
 ## Gotchas learned so far
+
+- **Reconnect and resume**: the data byte count must be exact — the server
+  REJECTs ±1 byte (0x03 fewer / 0x05 more) and that refusal ends the
+  stream, forcing a start-over (new ticket + HELLO). One authoritative
+  counter where frames are consumed (`rex_conn::StreamResume`), counting
+  every processed binary payload across all connections, never the WELCOME.
+  Keep the newest WELCOME token; never log it. A bare control client (not
+  attached to anything) does not survive its drop — its token dies at
+  once — so the reconnect path only matters for attached clients, which
+  is every real client. Websocket pings arriving mid-RPC used to kill
+  calls: `recv_json` skips control frames now.
 
 - tungstenite needs `ws://` URIs and, for manually built `Request`s, the full
   upgrade header set (`Sec-WebSocket-Key` included) — and success is HTTP 101.
