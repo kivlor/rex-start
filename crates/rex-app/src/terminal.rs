@@ -14,6 +14,22 @@ use rex_terminal::{Color, Frame};
 /// The system's monospace font, resolved once and reused for every pane.
 pub const MONO: &str = "DejaVu Sans Mono";
 
+/// The design cell, in pixels: the size the non-stretch layout draws a
+/// frame at (see `request_layout`). Grid negotiation asks for cols/rows
+/// that fit a pane at this cell size, so the server's programs are
+/// sized for how this client actually renders.
+pub const CELL_W_PX: f32 = 9.0;
+pub const CELL_H_PX: f32 = 18.0;
+
+/// The grid that fits a pane of `pane_w` x `pane_h` pixels: floor
+/// division by the cell size, never below 1x1 (the protocol's minimum)
+/// and capped at the protocol's 65535.
+pub fn grid_for(pane_w: f32, pane_h: f32) -> (u32, u32) {
+    let cols = (pane_w.max(0.0) / CELL_W_PX).floor() as u32;
+    let rows = (pane_h.max(0.0) / CELL_H_PX).floor() as u32;
+    (cols.clamp(1, 65535), rows.clamp(1, 65535))
+}
+
 /// One block's terminal, ready to draw.
 pub struct TerminalElement {
     frame: Arc<Frame>,
@@ -68,8 +84,8 @@ impl Element for TerminalElement {
             style.size.width = gpui::Length::Definite(gpui::DefiniteLength::Fraction(1.0));
             style.size.height = gpui::Length::Definite(gpui::DefiniteLength::Fraction(1.0));
         } else {
-            style.size.width = px(f32::from(self.frame.cols) * 9.0).into();
-            style.size.height = px(f32::from(self.frame.rows) * 18.0).into();
+            style.size.width = px(f32::from(self.frame.cols) * CELL_W_PX).into();
+            style.size.height = px(f32::from(self.frame.rows) * CELL_H_PX).into();
         }
         (window.request_layout(style, [], cx), ())
     }
