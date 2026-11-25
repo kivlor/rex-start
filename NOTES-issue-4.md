@@ -111,3 +111,23 @@ be assumed from `cargo test`). Against the local server it verified, via
   to the focused block).
 - Unit tests for `chunk_utf8` in rex-app (3) pass; sessions keytest-*/keyarrow
   killed after each run.
+
+## Step 3 — GPUI wiring
+
+- `app.rs`: `main_key` now handles, in order: (1) the app's own ctrl-alt-*
+  bindings locally (right/down/z/p/n — they keep precedence), (2) ctrl+v →
+  `cx.read_from_clipboard()` → `ClientCmd::Paste` (gpui 0.2.2 exposes no
+  paste event, so ctrl+v is the paste binding; noted), (3) every other
+  keystroke → `keystroke_to_key_event` → `ClientCmd::SendKey`.
+- `keystroke_to_key_event`: maps gpui keystrokes to the protocol's key
+  objects — W3C codes in snake_case (key_a, digit_7, minus, arrow_left,
+  enter, ...), mods "shift+ctrl+alt+super" (gpui's `platform` modifier maps
+  to `super`), text only for printable presses (named keys type nothing),
+  unshifted_codepoint from the unshifted key so ctrl+n-style bindings match
+  on layout. Chorded keys lose their text (the terminal gets the control
+  code via key+mods). Function/kypad keys and bare modifiers → None
+  (unhandled, for #5/#6).
+- 6 new unit tests for the mapping (13 pass in rex-app total).
+- Smoke (`WAYLAND_DISPLAY=wayland-0 REX_APP_DEBUG=1 … -s keyprobe`, timeout 15):
+  max_message_bytes logged, "keymap declared: 5 resolved bindings" (our
+  defaults), session attached, first frame 80x24 rendered, no panics.
