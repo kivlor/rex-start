@@ -227,3 +227,131 @@ plain ASCII) passed only because ASCII needs no escaping.
   later ctrl+d / arrow-key checks, end marker present on screen.
   Cleanup: `rex kill keytest-700926 keytest-701514`; no
   probe-stream-*.bin created.
+
+## Review feedback round 2 — AltGr, keymap honesty, paste shift
+
+### 1. AltGr: how characters reach the block on this layout
+
+Reviewer's question: "how do AltGr characters reach the block on your
+layout?" — investigated at three levels, no system settings touched:
+
+**gpui 0.2.2 source** (X11 and Wayland share `Keystroke::from_xkb` in
+`src/platform/linux/platform.rs`): `key_char` is xkbcommon's
+layout-resolved UTF-8 for the current modifier state (`key_get_utf8`),
+and `modifiers.alt` is Mod1-effective. gpui's own editors filter chorded
+`key_char` out downstream ("only allow shift modifier when inserting
+text"), which confirms `key_char` is `Some` even for plain alt chords.
+
+**libxkbcommon probe** (small C program, /tmp, no settings changed):
+- `de` default: Alt_R is `ISO_Level3_Shift` → Mod5=1, **Mod1=0**;
+  AltGr+q → utf8 `@`, AltGr+e → `€`. gpui reports `alt: false`,
+  `key_char: Some("@")` → the keystroke is NOT chorded and our existing
+  plain-text path delivers it. **On standard Linux layouts (the common
+  case) AltGr characters already reached the block; the chorded-strip
+  concern doesn't apply.**
+- `de` + `lv3:ralt_alt`: Alt_R is a plain Alt (Mod1=1) and the layout
+  composes nothing (utf8 is just `q`) — this option intentionally turns
+  AltGr off; nothing is lost.
+- `de` + `lv3:lalt_switch` (the reviewer's scenario made real: level 3
+  on Mod1): alt=1 AND utf8 = the composed char. Only this opt-in family
+  of XKB options trips the chorded path.
+
+**Live protocol probe** (throwaway `altgr_probe` example, deleted after;
+sessions destroyed): with a `cat -v` reader,
+- `mods:"alt", text:""` → `^[q` (the alt chord's ESC prefix);
+- `mods:"alt", text:"q"` → `^[q` — the block applies the alt chord even
+  when text is present, so naively keeping text would still swallow the
+  character;
+- `mods:"alt", consumed_mods:"alt", text:"@"` → `@` typed — the schema's
+  `consumed_mods` ("modifiers the keyboard layout used to produce
+  text") is the designed channel for exactly this.
+
+**Fix** (`keystroke_to_key_event`): with alt held and ctrl/super not,
+the keystroke is text-producing when the layout composed a character —
+the composed char either differs from the keystroke's key name (gpui
+falls back to the base key's letter for non-ASCII: key `"q"`,
+key_char `"€"`) or is itself not an ASCII alphanumeric (German AltGr+q:
+keysym IS `@`, so key == key_char == `"@"`). Then we send
+`text = key_char` with `consumed_mods: "alt"` (mods kept, so
+server-side bindings still see the chord — live-verified to type the
+char). A plain alt chord (US alt+q: key `"q"`, key_char `"q"`;
+alt+shift+s: key `"s"`, key_char `"S"`) stays chorded and keeps typing
+nothing — the reviewer's literal "key_char is Some while alt is held"
+rule would have converted every plain alt+letter into text, and the
+live probe shows the block would then drop the ESC-q chord. Known
+residual: a plain-alt+punctuation chord (Alt+.) is indistinguishable
+from an AltGr composition at the Keystroke level and will type its
+character; accepted because Mod1-mapped level 3 is an opt-in config and
+Alt+punct chords are rare (both facts in code comments).
+
+Couldn't verify live: a real AltGr keyboard press end-to-end (this
+machine is US layout); the path was verified piecewise instead —
+xkbcommon state → gpui keystroke fields (source + probe), keystroke →
+key event (unit tests), key event → typed char (live probe).
+
+### 2. ctrl+v paste
+
+`main_key` now requires shift NOT held: ctrl+shift+v flows to the
+server like any other chord.
+
+### 3. init.lua rebinds of app.* are now honored
+
+Design: after the `client.keymap` declaration, the RESOLVED bindings
+(`bindings` in the result, in try order) decide which of our five
+declared defaults are still OURS:
+- a binding for the key with action `client.key.forward` (what a Lua
+  binding reports as) always wins per the docs — key leaves our set;
+- a key bound to another action, or removed, leaves the set;
+- sequences (keys length > 1) and mode-scoped bindings wait on the
+  server — not claimed locally.
+Pure helpers in `client.rs`: `normalize_key` (canonical binding
+spelling: mods in protocol order, lowercase, cmd→super — unit-tested)
+and `key_is_ours`/`resolved_local_keys` (unit-tested against fresh,
+rebound, sequence, mode, and empty binding lists). The actor sends the
+set to the UI as `ClientEvent::Keymap(HashSet<String>)`; on a failed
+`client.keymap` call it sends the full default set (the UI also STARTS
+with the full set, so keys work before the event arrives) and
+debug-logs. The UI keeps `ours` and its `main_key` handles a ctrl-alt
+key locally only when `binding_key(keystroke)` (same spelling, from
+GPUI modifiers + lowercase key) is in the set — everything else flows
+to `client.key`, where a Lua-bound key hits `client.key.forward`.
+`keymap_changed` is handled in the actor: the event's fields sit one
+payload level down (`payload.payload.hash` — found by logging the raw
+event live); a hash different from the last `client.keymap` result's
+`config.hash` re-declares and re-publishes the set, the same hash is a
+no-op.
+
+Live evidence: GUI smoke logged `keymap: 6 resolved bindings; still
+ours: {ctrl+alt+down, ctrl+alt+n, ctrl+alt+p, ctrl+alt+right,
+ctrl+alt+z}` (init.lua's ctrl+a k is the 6th, a sequence, correctly
+not ours); `rex config reload` with an unchanged file → no refetch
+(hash equal); with a changed file → "keymap changed (hash …),
+re-fetching" and a fresh set. init.lua was restored byte-identical
+after the test (created by the earlier acceptance run, unchanged
+content).
+
+Known limits (honest, documented): a Lua rebind of app.* to a key the
+UI doesn't know locally still won't perform the action (the server
+would need `client.perform` plumbing, out of scope here) — but it now
+at least stops the UI from swallowing the key, and the default key
+becomes a server-side binding.
+
+### 4. `prefix`
+
+Kept the plumbing (`ClientCmd::SendKey { prefix }` → `client.key`'s
+`prefix`), with a doc-comment saying it is unused pending sequence
+support (#5/#6). It is not used anywhere else, so removal was the only
+alternative; kept because the protocol field is the designed hook for
+sequences and the client-side "wait for the next key" work lands next.
+
+### 5. duplicate chunker tests
+
+Removed from rex-app's test module (pure duplicates of rex-conn's own
+suite, calling `rex_conn::chunk_json_safe` directly):
+`chunk_json_safe_splits_on_char_boundaries`,
+`chunk_json_safe_empty_and_huge`,
+`chunk_json_safe_wide_char_in_narrow_chunk`. Kept the rex-app-only
+budget/property test `chunk_json_safe_paste_stays_within_budget`.
+Replaced by the new `normalize_key` / `resolved_local_keys_honor_…` /
+`default_local_keys_…` tests (client.rs) and the AltGr + `binding_key`
+tests (app.rs). rex-app: 19 tests, workspace all green.
