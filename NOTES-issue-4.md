@@ -131,3 +131,32 @@ be assumed from `cargo test`). Against the local server it verified, via
 - Smoke (`WAYLAND_DISPLAY=wayland-0 REX_APP_DEBUG=1 … -s keyprobe`, timeout 15):
   max_message_bytes logged, "keymap declared: 5 resolved bindings" (our
   defaults), session attached, first frame 80x24 rendered, no panics.
+
+## Step 4 — init.lua binding acceptance
+
+**`~/.config/rex/init.lua` did NOT exist; it was CREATED for this test.**
+Full content (new file):
+
+```lua
+-- rex config — CREATED NEW (this file did not exist before) for the
+-- issue-4 acceptance test: a Lua key binding that fires through
+-- client.key. ctrl+a then k renames the session the key was typed in.
+rex.bind("ctrl+a>k", function(ctx, ev)
+  rex.session.set_label{ label = "key-binding-fired" }
+  return true
+end)
+```
+
+- `rex config check`: bindings: 1, no diagnostics.
+- `rex config reload` was needed before the live server picked it up
+  (generation 2). `rex keymap` then listed `ctrl+a k  client.key.forward  init.lua:4`.
+- Acceptance: created session `keybind`, sent client.key with
+  `prefix:["ctrl+a"]`, key `key_k` → **`{"handled":true}`**, and the
+  session's label changed to `key-binding-fired` (visible in `rex ls`) —
+  the Lua function ran and consumed the key.
+- The app uses the same client.key path, so GUI-typed ctrl+a k fires it
+  identically (keymap bindings surface as client.key.forward, which is
+  what SendKey sends).
+- Cleanup: killed keybind/key-binding-fired, keyprobe, keytest-* sessions;
+  no probe-stream-*.bin were created (only the two committed fixtures
+  remain, untouched).
