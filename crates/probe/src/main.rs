@@ -88,7 +88,10 @@ async fn connect(path: &str, uri_path: &str, subprotocol: &str) -> Result<Ws> {
         .body(())?;
     let (ws, resp) = tokio_tungstenite::client_async(req, stream).await?;
     if resp.status() != 101 {
-        bail!("websocket handshake over {uri_path} failed: {}", resp.status());
+        bail!(
+            "websocket handshake over {uri_path} failed: {}",
+            resp.status()
+        );
     }
     Ok(ws)
 }
@@ -100,14 +103,13 @@ async fn send_json(ws: &mut Ws, v: &Value) -> Result<()> {
 
 /// Read the next text message as JSON (skips nothing; control is all text).
 async fn recv_json(ws: &mut Ws) -> Result<Value> {
-    loop {
-        match ws.next().await {
-            Some(Ok(Message::Text(s))) => return Ok(serde_json::from_str(&s)?),
-            Some(Ok(m)) => bail!("unexpected control message: {m:?}"),
-            Some(Err(e)) => return Err(e.into()),
-            None => bail!("control connection closed"),
-        }
-    }}
+    match ws.next().await {
+        Some(Ok(Message::Text(s))) => Ok(serde_json::from_str(&s)?),
+        Some(Ok(m)) => bail!("unexpected control message: {m:?}"),
+        Some(Err(e)) => Err(e.into()),
+        None => bail!("control connection closed"),
+    }
+}
 
 struct Rpc {
     ws: Ws,
@@ -176,7 +178,10 @@ async fn main() -> Result<()> {
         welcome["protocol"], revision, welcome["client"]["id"]
     );
 
-    let mut rpc = Rpc { ws: control, next_id: 1 };
+    let mut rpc = Rpc {
+        ws: control,
+        next_id: 1,
+    };
 
     // ---- create a session with one shell block ----
     let created = rpc
@@ -201,7 +206,8 @@ async fn main() -> Result<()> {
     println!("session: {session_id}\nblock:   {block_id}");
 
     // ---- attach: required before data.connect ----
-    rpc.call("session.attach", json!({"session_id": session_id})).await?;
+    rpc.call("session.attach", json!({"session_id": session_id}))
+        .await?;
 
     // ---- type the command ----
     rpc.call(
@@ -248,41 +254,39 @@ async fn main() -> Result<()> {
     let stream_path_task = stream_path.clone();
     let data_task = tokio::spawn(async move {
         let mut out = std::fs::File::create(&stream_path_task).expect("create stream file");
-        let mut buffer: Vec<u8> = Vec::new();
-        let mut scanned = 0usize;
-        let prefix = format!("\x1b_rex1;{nonce};");
+        // rex1 APC messages: ESC _ rex1;<nonce>;<json> ESC \
+        // rex-terminal's filter skips look-alikes whose nonce doesn't match.
+        let mut filter = rex_terminal::StreamFilter::new(nonce);
         loop {
             match data.next().await {
                 Some(Ok(Message::Binary(b))) => {
                     use std::io::Write;
                     out.write_all(&b).expect("write stream file");
-                    buffer.extend_from_slice(&b);
-                    // rex1 APC messages: ESC _ rex1;<nonce>;<json> ESC \
-                    let mut from = scanned.saturating_sub(prefix.len() + 8);
-                    while let Some(hit) = buffer[from..].windows(prefix.len()).position(|w| w == prefix.as_bytes()) {
-                        let start = from + hit + prefix.len();
-                        match buffer[start..].iter().position(|&c| c == 0x1b) {
-                            Some(end_rel) if buffer.get(start + end_rel + 1) == Some(&b'\\') => {
-                                let end = start + end_rel;
-                                if let Ok(v) = serde_json::from_slice::<Value>(&buffer[start..end]) {
-                                    match v["type"].as_str().unwrap_or("") {
-                                        "resize" => eprintln!(
-                                            "[rex1] resize {}x{}",
-                                            v["cols"], v["rows"]
-                                        ),
-                                        "theme" => eprintln!("[rex1] theme {}", v["scheme"]),
-                                        "child_exited" => {
-                                            eprintln!("[rex1] child_exited {}", v["exit_code"]);
-                                            let _ = tx.send(v["exit_code"].as_u64().unwrap_or(0)).await;
-                                        }
-                                        other => eprintln!("[rex1] {other}"),
-                                    }
+                    let mut exits: Vec<u64> = Vec::new();
+                    filter.feed(&b, |piece| {
+                        if let rex_terminal::Piece::Message(v) = piece {
+                            match v {
+                                rex_terminal::RexMessage::Resize { cols, rows, .. } => {
+                                    eprintln!("[rex1] resize {cols}x{rows}");
                                 }
-                                scanned = start + end_rel + 2;
-                                from = scanned;
+                                rex_terminal::RexMessage::Theme { scheme, .. } => {
+                                    eprintln!(
+                                        "[rex1] theme {}",
+                                        scheme.as_deref().unwrap_or("(from background)")
+                                    );
+                                }
+                                rex_terminal::RexMessage::ChildExited { exit_code } => {
+                                    eprintln!("[rex1] child_exited {exit_code}");
+                                    exits.push(exit_code.max(0) as u64);
+                                }
+                                rex_terminal::RexMessage::Unknown => {
+                                    eprintln!("[rex1] (unknown type)");
+                                }
                             }
-                            _ => break, // escape not complete yet
                         }
+                    });
+                    for code in exits {
+                        let _ = tx.send(code).await;
                     }
                 }
                 Some(Ok(m)) => bail!("unexpected data message: {m:?}"),
