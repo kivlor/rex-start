@@ -254,7 +254,71 @@ Findings recorded along the way:
 - Cell-px cross-check number from the live server: resize rex1 reported
   9x18px, exactly the `CELL_W_PX`/`CELL_H_PX` metrics we sent.
 
-## Step 4 — GUI smoke (filled in after live runs)
+## Step 4 — GUI smoke (live run)
+
+```
+WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 REX_APP_DEBUG=1 \
+  mise exec -- cargo run -p rex-app -- -s gui-own   # under `timeout 15`
+```
+
+Debug log (verbatim, /tmp/gui-own.log):
+
+```
+[rex-app] bootstrap: 1 sessions, 1 attached
+[rex-app] showing session session:01a210ed-b7e9-7ecf-81b9-846f1cd44f04 (revision 1)
+[rex-app] block block:01a210ed-b7ea-70a8-ad60-f053507483e1: resize 80x24 at 8x16px differs from our 9x18px (someone else owns the grid?)
+[rex-app] block block:01a210ed-b7ea-70a8-ad60-f053507483e1: first frame 80x24
+[rex-app] block:01a210ed-b7ea-70a8-ad60-f053507483e1 renders: kivlor@kyrios:~/Code/rex-start$
+[rex-app] own_block block:01a210ed-b7ea-70a8-ad60-f053507483e1 at 121x38: owner=client:01a210ed-cdd7-7ddb-9122-7da7701d7d6f
+[rex-app] block block:01a210ed-b7ea-70a8-ad60-f053507483e1: resize 121x38 at 9x18px matches our cell metrics
+[rex-app] resize block:01a210ed-b7ea-70a8-ad60-f053507483e1 to 121x38
+[rex-app] block_owner_changed: ... owner=Some("client:01a210ed-cdd7-...") previous=None reason=take
+[rex-app] view changed to revision 2, refreshing
+[rex-app] refreshed view to revision 2
+```
+
+What this shows:
+
+- **own_block fired on window activation** with the fitting grid 121x38:
+  the 1100x720 window minus the 26px header and 3px gutter is
+  1097x691 px → floor(1097/9)=121, floor(691/18)=38. Exactly grid_for's
+  math (and its split-pane unit test).
+- **The resize rex1 arrived** at 9x18px — the cell-px cross-check branch
+  logged "matches our cell metrics". The pre-claim snapshot's resize rex1
+  (80x24 at 8x16px, the server default) exercised the mismatch branch.
+- **block_owner_changed** handled (reason=take, view refreshed).
+- **No panics**; the run ended at `timeout`'s SIGTERM (exit 124).
+
+Ownership after the window closed (timeout kill is not a graceful close,
+  so the server's `lost` rule — not our disown — released the claim):
+
+- `rex capture --session gui-own` still showed the live prompt: the block
+  survived, at the 121x38 grid we negotiated.
+- From a second control connection, `session.own_block` with mode
+  `request` — which only claims blocks that have **no owner** — succeeded
+  and reported the CLI client as the new owner: proof the dead app client
+  no longer owned it. `client.list` showed the app client with
+  `connection_state: lost`. A `session.disown_block` handed it back to
+  no-owner and the block stayed alive.
+- The graceful-close path (window X → command channel drops → actor's
+  end-of-loop `disown_all` before the socket closes) is wired in code but
+  was not exercised live: SIGTERM kills the whole process, and I have no
+  tool on this Wayland session to click the window's close button or
+  drive the WM to resize. Noted as a leftover for #6 (add a close key /
+  integration hook so the graceful path can be driven headlessly).
+
+Could not do the visual htop reflow check: no way to drive the WM resize
+  here. The resize path is wired — every render recomputes each pane's
+  grid via grid_for and re-owns only on change — and the same
+  own/resize/reflow sequence was verified end-to-end live by the step-3
+  example (resize rex1 + stty size at two grids).
+
+Test sessions cleaned up: `rex kill gui-own` (plus ownprobe/ownprobe2 and
+the two owntest-* labels from the example's earlier failed runs). No
+probe-stream-*.bin files were generated; the two committed fixture .bin
+files untouched.
+
+## Step 5 — final checks
 
 (to be recorded)
 
