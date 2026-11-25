@@ -45,12 +45,17 @@ WAYLAND_DISPLAY=wayland-0 cargo run -p rex-app -- --new-session  # make one and 
 REX_APP_DEBUG=1 … # protocol/render progress on stderr (frames, view refreshes)
 ```
 
-Keys: `ctrl-alt-right` horizontal split, `ctrl-alt-down` vertical split,
-`ctrl-alt-z` zoom/unzoom, `ctrl-alt-p` session picker (up/down, enter to
-switch, `n` for a new session, esc to close). Splits and zoom go through
-the server's ordered methods, one call at a time; layout geometry always
-comes from the server. Closing the window only disconnects — sessions
-and their programs keep running.
+Keys: `ctrl-shift-d` split right, `ctrl-shift-e` split below,
+`ctrl-shift-z` zoom/unzoom, `ctrl-shift-arrows` focus the neighboring
+pane, `ctrl-alt-p` session picker (up/down, enter to switch, `n` for a
+new session, esc to close), `ctrl-alt-n` new session. The chords match
+the official Mac client's (cmd+d/cmd+shift+d on Linux equivalents), and
+the declared action names are the server's canonical ones
+(`pane.split.right`, `pane.zoom`, `pane.focus.*`, …), so an init.lua
+written for the Mac client rebinds this client too. Splits, zoom, and
+focus go through the server's ordered methods, one call at a time;
+layout geometry always comes from the server. Closing the window only
+disconnects — sessions and their programs keep running.
 
 Building `rex-app` needs GPUI's Linux system libraries. On Fedora install
 the development packages with

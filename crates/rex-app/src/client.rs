@@ -131,7 +131,7 @@ pub enum ClientEvent {
     /// Something worth a line in the status bar.
     Notice(String),
     /// The keys the server's resolved keymap still binds to the app's own
-    /// actions, in binding spelling ("ctrl+alt+z" — the same form the UI's
+    /// actions, in binding spelling ("shift+ctrl+d" — the same form the UI's
     /// `binding_key` produces). The UI handles only these locally; every
     /// other key flows to `client.key`, so a Lua binding gets its chance.
     /// Sent after the `client.keymap` declaration and after every
@@ -205,14 +205,31 @@ pub fn start(socket: String, preferred: Option<String>, new_session: bool) -> Re
 }
 
 /// The app's own actions, exactly as `declare_keymap` declares them.
-const OUR_ACTIONS: [&str; 4] = ["app.split", "app.zoom", "app.picker", "app.new_session"];
+/// The pane names are the server's canonical ones (as the official Mac
+/// client and rex-linux name them), so an init.lua written for those
+/// clients rebinds ours too.
+const OUR_ACTIONS: [&str; 9] = [
+    "pane.split.right",
+    "pane.split.down",
+    "pane.zoom",
+    "pane.focus.left",
+    "pane.focus.right",
+    "pane.focus.up",
+    "pane.focus.down",
+    "app.picker",
+    "app.new_session",
+];
 
 /// The default layer's key bindings, in the spelling `normalize_key`
 /// produces and the UI's `binding_key` matches.
-const DEFAULT_LOCAL_KEYS: [&str; 5] = [
-    "ctrl+alt+right",
-    "ctrl+alt+down",
-    "ctrl+alt+z",
+const DEFAULT_LOCAL_KEYS: [&str; 9] = [
+    "shift+ctrl+d",
+    "shift+ctrl+e",
+    "shift+ctrl+z",
+    "shift+ctrl+left",
+    "shift+ctrl+right",
+    "shift+ctrl+up",
+    "shift+ctrl+down",
     "ctrl+alt+p",
     "ctrl+alt+n",
 ];
@@ -438,8 +455,8 @@ async fn start_actor(
     };
 
     // Declare the app's own actions and their default bindings, so the
-    // server's keymap (and init.lua) knows what ctrl-alt-* does here and
-    // can rebind it. The app still handles the ctrl-alt-* keys locally
+    // server's keymap (and init.lua) knows what our chords do here and
+    // can rebind them. The app still handles those keys locally
     // first; this is a declaration, not a routing table.
     actor.declare_keymap().await;
 
@@ -772,9 +789,11 @@ impl Actor {
     }
 
     /// `client.keymap`: declare the app's own actions (kind "client") and
-    /// the default layer binding the app's ctrl-alt-* keys to them, then
+    /// the default layer binding our chords to them, then
     /// publish which of those keys the RESOLVED keymap still binds to our
-    /// actions. init.lua can rebind these names; a Lua-bound key comes back
+    /// actions. The pane.* names are the server's canonical ones, so an
+    /// init.lua written for the official Mac client (or rex-linux) binds
+    /// ours too. init.lua can rebind these names; a Lua-bound key comes back
     /// as `client.key.forward`, so it leaves our set and flows to
     /// `client.key` — where the binding actually fires. If the call fails,
     /// the UI keeps handling every declared default locally (the
@@ -783,18 +802,53 @@ impl Actor {
         let payload = json!({
             "actions": [
                 {
-                    "name": "app.split",
+                    "name": "pane.split.right",
                     "kind": "client",
-                    "title": "Split Pane",
+                    "title": "Split Pane Right",
                     "category": "Layouts",
-                    "description": "Split the focused pane horizontally or vertically.",
+                    "description": "Split the focused pane to the right (horizontal).",
                 },
                 {
-                    "name": "app.zoom",
+                    "name": "pane.split.down",
+                    "kind": "client",
+                    "title": "Split Pane Down",
+                    "category": "Layouts",
+                    "description": "Split the focused pane downward (vertical).",
+                },
+                {
+                    "name": "pane.zoom",
                     "kind": "client",
                     "title": "Zoom Pane",
                     "category": "Layouts",
                     "description": "Zoom the focused pane to fill the window, or undo the zoom.",
+                },
+                {
+                    "name": "pane.focus.left",
+                    "kind": "client",
+                    "title": "Focus Pane Left",
+                    "category": "Layouts",
+                    "description": "Focus the pane to the left of the focused one.",
+                },
+                {
+                    "name": "pane.focus.right",
+                    "kind": "client",
+                    "title": "Focus Pane Right",
+                    "category": "Layouts",
+                    "description": "Focus the pane to the right of the focused one.",
+                },
+                {
+                    "name": "pane.focus.up",
+                    "kind": "client",
+                    "title": "Focus Pane Up",
+                    "category": "Layouts",
+                    "description": "Focus the pane above the focused one.",
+                },
+                {
+                    "name": "pane.focus.down",
+                    "kind": "client",
+                    "title": "Focus Pane Down",
+                    "category": "Layouts",
+                    "description": "Focus the pane below the focused one.",
                 },
                 {
                     "name": "app.picker",
@@ -815,9 +869,13 @@ impl Actor {
                 {
                     "name": "default",
                     "bindings": [
-                        {"keys": ["ctrl+alt+right"], "action": "app.split", "args": {"direction": "horizontal"}},
-                        {"keys": ["ctrl+alt+down"], "action": "app.split", "args": {"direction": "vertical"}},
-                        {"keys": ["ctrl+alt+z"], "action": "app.zoom"},
+                        {"keys": ["ctrl+shift+d"], "action": "pane.split.right"},
+                        {"keys": ["ctrl+shift+e"], "action": "pane.split.down"},
+                        {"keys": ["ctrl+shift+z"], "action": "pane.zoom"},
+                        {"keys": ["ctrl+shift+left"], "action": "pane.focus.left"},
+                        {"keys": ["ctrl+shift+right"], "action": "pane.focus.right"},
+                        {"keys": ["ctrl+shift+up"], "action": "pane.focus.up"},
+                        {"keys": ["ctrl+shift+down"], "action": "pane.focus.down"},
                         {"keys": ["ctrl+alt+p"], "action": "app.picker"},
                         {"keys": ["ctrl+alt+n"], "action": "app.new_session"}
                     ]
@@ -1897,10 +1955,16 @@ mod tests {
     #[test]
     fn resolved_local_keys_honor_rebinds_and_removals() {
         // Everything still ours: the resolved list of a fresh server.
+        // (The server may spell the mods in either order; normalize_key
+        // canonicalizes to shift+ctrl.)
         let fresh = json!([
-            {"keys": ["ctrl+alt+right"], "action": "app.split", "args": {"direction": "horizontal"}},
-            {"keys": ["ctrl+alt+down"], "action": "app.split", "args": {"direction": "vertical"}},
-            {"keys": ["ctrl+alt+z"], "action": "app.zoom"},
+            {"keys": ["ctrl+shift+d"], "action": "pane.split.right"},
+            {"keys": ["ctrl+shift+e"], "action": "pane.split.down"},
+            {"keys": ["shift+ctrl+z"], "action": "pane.zoom"},
+            {"keys": ["ctrl+shift+left"], "action": "pane.focus.left"},
+            {"keys": ["ctrl+shift+right"], "action": "pane.focus.right"},
+            {"keys": ["ctrl+shift+up"], "action": "pane.focus.up"},
+            {"keys": ["ctrl+shift+down"], "action": "pane.focus.down"},
             {"keys": ["ctrl+alt+p"], "action": "app.picker"},
             {"keys": ["ctrl+alt+n"], "action": "app.new_session"}
         ]);
@@ -1908,23 +1972,27 @@ mod tests {
 
         // init.lua took over ctrl+alt+p (a Lua binding reports as
         // client.key.forward, which always wins), ctrl+alt+n was rebound
-        // to another action, ctrl+alt+right starts a sequence, and
-        // ctrl+alt+down was removed: only zoom stays ours. A mode
-        // binding for ctrl+alt+z must not hide the modeless one.
+        // to another action, ctrl+shift+d starts a sequence, and
+        // ctrl+shift+e was removed: only the zoom and focus keys stay
+        // ours. A mode binding for shift+ctrl+z must not hide the
+        // modeless one.
         let rebound = json!([
             {"keys": ["ctrl+alt+p"], "action": "client.key.forward", "source": "init.lua:3"},
-            {"keys": ["ctrl+alt+z"], "action": "app.zoom"},
-            {"keys": ["ctrl+alt+z"], "action": "client.key.forward", "mode": "resize"},
+            {"keys": ["shift+ctrl+z"], "action": "pane.zoom"},
+            {"keys": ["ctrl+shift+z"], "action": "client.key.forward", "mode": "resize"},
             {"keys": ["ctrl+alt+n"], "action": "dev_layout"},
-            {"keys": ["ctrl+alt+right", "x"], "action": "app.split"}
+            {"keys": ["ctrl+shift+d", "x"], "action": "pane.split.right"}
         ]);
         let rebound: &[serde_json::Value] = rebound.as_array().unwrap();
-        assert!(key_is_ours(rebound, "ctrl+alt+z"));
+        assert!(key_is_ours(rebound, "shift+ctrl+z"));
         assert!(!key_is_ours(rebound, "ctrl+alt+p"));
         assert!(!key_is_ours(rebound, "ctrl+alt+n"));
-        assert!(!key_is_ours(rebound, "ctrl+alt+right"));
-        assert!(!key_is_ours(rebound, "ctrl+alt+down"));
-        let only_zoom: HashSet<String> = ["ctrl+alt+z"].iter().map(|s| s.to_string()).collect();
+        assert!(!key_is_ours(rebound, "shift+ctrl+d"));
+        assert!(!key_is_ours(rebound, "shift+ctrl+e"));
+        // A default the rebound list simply omits (the focus keys) is
+        // gone from the set too, like a removed binding.
+        assert!(!key_is_ours(rebound, "shift+ctrl+left"));
+        let only_zoom: HashSet<String> = ["shift+ctrl+z"].iter().map(|s| s.to_string()).collect();
         assert_eq!(super::resolved_local_keys(&json!(rebound)), only_zoom);
 
         // Nothing bound at all: nothing ours.
@@ -1936,8 +2004,9 @@ mod tests {
 
     #[test]
     fn default_local_keys_are_the_declared_defaults() {
-        assert!(default_local_keys().contains("ctrl+alt+z"));
-        assert_eq!(default_local_keys().len(), 5);
+        assert!(default_local_keys().contains("shift+ctrl+d"));
+        assert!(default_local_keys().contains("ctrl+alt+p"));
+        assert_eq!(default_local_keys().len(), 9);
     }
 
     #[test]

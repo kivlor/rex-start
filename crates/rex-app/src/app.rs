@@ -30,7 +30,7 @@ const PICKER_BG: u32 = 0x222222;
 const PICKER_SEL: u32 = 0x3d4a78;
 
 /// One step down from the picker list, for the hint line.
-const KEYS: &str = "ctrl-alt-right split h \u{b7} ctrl-alt-down split v \u{b7} ctrl-alt-z zoom \u{b7} ctrl-alt-p sessions";
+const KEYS: &str = "ctrl-shift-d/e splits \u{b7} ctrl-shift-z zoom \u{b7} ctrl-shift-arrows focus \u{b7} ctrl-alt-p sessions";
 
 pub struct RexApp {
     focus_handle: FocusHandle,
@@ -266,53 +266,79 @@ impl RexApp {
         }
     }
 
-    /// Keys for the session view: the app's own ctrl-alt-* bindings take
-    /// precedence locally — but only the ones the server's resolved keymap
-    /// still binds to our actions (a Lua rebind moves them out from under
-    /// us, and those keys then flow to `client.key`, where init.lua's
-    /// `client.key.forward` gets first chance) — ctrl+v pastes the
-    /// clipboard, and every other typed key goes to the server through
+    /// Keys for the session view: the app's own chords (the Mac client's
+    /// splits/zoom/focus on ctrl+shift, picker/new-session on ctrl+alt)
+    /// take precedence locally — but only the ones the server's resolved
+    /// keymap still binds to our actions (a Lua rebind moves them out
+    /// from under us, and those keys then flow to `client.key`, where
+    /// init.lua's `client.key.forward` gets first chance) — ctrl+v pastes
+    /// the clipboard, and every other typed key goes to the server through
     /// `client.key`, so the server's Lua bindings get first chance at it.
+    /// ctrl+shift+v is none of ours: it flows to `client.key` untouched.
     fn main_key(&mut self, keystroke: &gpui::Keystroke, cx: &mut Context<Self>) -> bool {
-        if keystroke.modifiers.control
-            && keystroke.modifiers.alt
-            && self.ours.contains(&binding_key(keystroke))
-        {
-            match keystroke.key.as_str() {
-                "right" => {
-                    self.send(ClientCmd::NewSplit {
-                        direction: Direction::Horizontal,
-                    });
-                    return true;
-                }
-                "down" => {
-                    self.send(ClientCmd::NewSplit {
-                        direction: Direction::Vertical,
-                    });
-                    return true;
-                }
-                "z" => {
-                    self.send(ClientCmd::ToggleZoom);
-                    return true;
-                }
-                "p" => {
-                    if self.picker.is_none() {
-                        let selected = self
-                            .session_id
-                            .as_ref()
-                            .and_then(|id| self.sessions.iter().position(|s| &s.session_id == id))
-                            .unwrap_or(0);
-                        self.picker = Some(selected);
-                    } else {
-                        self.picker = None;
+        if self.ours.contains(&binding_key(keystroke)) {
+            if keystroke.modifiers.control && keystroke.modifiers.shift && !keystroke.modifiers.alt
+            {
+                match keystroke.key.as_str() {
+                    "d" => {
+                        self.send(ClientCmd::NewSplit {
+                            direction: Direction::Horizontal,
+                        });
+                        return true;
                     }
-                    return true;
+                    "e" => {
+                        self.send(ClientCmd::NewSplit {
+                            direction: Direction::Vertical,
+                        });
+                        return true;
+                    }
+                    "z" => {
+                        self.send(ClientCmd::ToggleZoom);
+                        return true;
+                    }
+                    "left" | "right" | "up" | "down" => {
+                        let direction = match keystroke.key.as_str() {
+                            "left" => FocusDirection::Left,
+                            "right" => FocusDirection::Right,
+                            "up" => FocusDirection::Up,
+                            _ => FocusDirection::Down,
+                        };
+                        let focused = self.focused_block();
+                        if let Some(neighbor) =
+                            focus_neighbor(&self.panes(), focused.as_deref(), direction)
+                        {
+                            self.send(ClientCmd::FocusBlock(neighbor));
+                        }
+                        return true;
+                    }
+                    _ => {}
                 }
-                "n" => {
-                    self.send(ClientCmd::NewSession("rex-app".into()));
-                    return true;
+            } else if keystroke.modifiers.control
+                && keystroke.modifiers.alt
+                && !keystroke.modifiers.shift
+            {
+                match keystroke.key.as_str() {
+                    "p" => {
+                        if self.picker.is_none() {
+                            let selected = self
+                                .session_id
+                                .as_ref()
+                                .and_then(|id| {
+                                    self.sessions.iter().position(|s| &s.session_id == id)
+                                })
+                                .unwrap_or(0);
+                            self.picker = Some(selected);
+                        } else {
+                            self.picker = None;
+                        }
+                        return true;
+                    }
+                    "n" => {
+                        self.send(ClientCmd::NewSession("rex-app".into()));
+                        return true;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
         // Paste: gpui 0.2 exposes no paste event, so ctrl+v reads the
@@ -584,6 +610,74 @@ impl RexApp {
     }
 }
 
+/// One step of pane focus movement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// True when `rect` lies fully on the far side of `mine` in that
+/// direction (a hair of slack for exactly-adjacent server fractions).
+fn is_ahead(rect: [f64; 4], mine: [f64; 4], direction: FocusDirection) -> bool {
+    const EPSILON: f64 = 1e-9;
+    match direction {
+        FocusDirection::Left => rect[0] + rect[2] <= mine[0] + EPSILON,
+        FocusDirection::Right => rect[0] >= mine[0] + mine[2] - EPSILON,
+        FocusDirection::Up => rect[1] + rect[3] <= mine[1] + EPSILON,
+        FocusDirection::Down => rect[1] >= mine[1] + mine[3] - EPSILON,
+    }
+}
+
+/// How far `rect`'s near edge sits from `mine`'s far edge along the
+/// direction of travel; negative only within the slack above.
+fn edge_gap(rect: [f64; 4], mine: [f64; 4], direction: FocusDirection) -> f64 {
+    match direction {
+        FocusDirection::Left => mine[0] - (rect[0] + rect[2]),
+        FocusDirection::Right => rect[0] - (mine[0] + mine[2]),
+        FocusDirection::Up => mine[1] - (rect[1] + rect[3]),
+        FocusDirection::Down => rect[1] - (mine[1] + mine[3]),
+    }
+}
+
+/// The pane to focus one step from the focused one: the nearest pane
+/// that lies wholly in that direction and overlaps the focused rect on
+/// the perpendicular axis, so the step lands beside us, never diagonally
+/// past a corner. Geometry is the server's placement fractions
+/// (view.rs), so a zoomed window has one placement and no neighbor, and
+/// a step off the layout is a no-op.
+fn focus_neighbor(
+    panes: &[(String, [f64; 4])],
+    focused: Option<&str>,
+    direction: FocusDirection,
+) -> Option<String> {
+    let mine: [f64; 4] = panes
+        .iter()
+        .find(|(id, _)| Some(id.as_str()) == focused)
+        .map(|(_, rect)| *rect)?;
+    let overlaps = |rect: [f64; 4]| match direction {
+        FocusDirection::Left | FocusDirection::Right => {
+            rect[1] < mine[1] + mine[3] && rect[1] + rect[3] > mine[1]
+        }
+        FocusDirection::Up | FocusDirection::Down => {
+            rect[0] < mine[0] + mine[2] && rect[0] + rect[2] > mine[0]
+        }
+    };
+    panes
+        .iter()
+        .filter(|(id, rect)| {
+            Some(id.as_str()) != focused && overlaps(*rect) && is_ahead(*rect, mine, direction)
+        })
+        .min_by(|(_, a), (_, b)| {
+            edge_gap(*a, mine, direction)
+                .partial_cmp(&edge_gap(*b, mine, direction))
+                .expect("the server reports finite rect fractions")
+        })
+        .map(|(id, _)| id.clone())
+}
+
 /// Maps a GPUI keystroke to a `client.key` key event: physical key as the
 /// W3C KeyboardEvent code in snake_case, mods joined with `+`, the text
 /// the key typed, and the unshifted code point that layout-dependent
@@ -727,7 +821,7 @@ fn keystroke_to_key_event(keystroke: &gpui::Keystroke) -> Option<KeyEvent> {
 
 /// A keystroke in the spelling keymap bindings use: mods in the
 /// protocol's order (shift, ctrl, alt, super), then the lowercase key,
-/// e.g. "ctrl+alt+z". This is what `ClientEvent::Keymap` carries and
+/// e.g. "shift+ctrl+d". This is what `ClientEvent::Keymap` carries and
 /// `main_key` matches on.
 fn binding_key(keystroke: &gpui::Keystroke) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -772,6 +866,93 @@ mod tests {
         // Degenerate fractions never collapse below 1 px.
         let (w, h) = pane_pixels((10.0, 30.0), [0.0, 0.0, 0.0, 0.0]);
         assert_eq!((w, h), (1.0, 1.0));
+    }
+
+    fn pane(id: &str, rect: [f64; 4]) -> (String, [f64; 4]) {
+        (id.to_owned(), rect)
+    }
+
+    #[test]
+    fn focus_neighbor_moves_between_split_sides() {
+        // Two side-by-side panes: a step left from the right one lands on
+        // the left one, and a step off the layout is a no-op.
+        let panes = [
+            pane("left", [0.0, 0.0, 0.5, 1.0]),
+            pane("right", [0.5, 0.0, 0.5, 1.0]),
+        ];
+        assert_eq!(
+            focus_neighbor(&panes, Some("right"), FocusDirection::Left),
+            Some("left".to_owned())
+        );
+        assert_eq!(
+            focus_neighbor(&panes, Some("left"), FocusDirection::Right),
+            Some("right".to_owned())
+        );
+        assert_eq!(
+            focus_neighbor(&panes, Some("left"), FocusDirection::Left),
+            None
+        );
+        assert_eq!(
+            focus_neighbor(&panes, Some("right"), FocusDirection::Up),
+            None
+        );
+    }
+
+    #[test]
+    fn focus_neighbor_prefers_the_nearest_overlapping_pane() {
+        // Top half plus two bottom quarters: from the top pane a step down
+        // reaches both bottom panes, but the step lands on whichever is
+        // nearest — they tie, so the first in layout order wins; from the
+        // bottom-left pane a step right skips nothing and lands beside.
+        let panes = [
+            pane("top", [0.0, 0.0, 1.0, 0.5]),
+            pane("bottom-left", [0.0, 0.5, 0.5, 0.5]),
+            pane("bottom-right", [0.5, 0.5, 0.5, 0.5]),
+        ];
+        assert_eq!(
+            focus_neighbor(&panes, Some("top"), FocusDirection::Down),
+            Some("bottom-left".to_owned())
+        );
+        assert_eq!(
+            focus_neighbor(&panes, Some("bottom-left"), FocusDirection::Up),
+            Some("top".to_owned())
+        );
+        assert_eq!(
+            focus_neighbor(&panes, Some("bottom-left"), FocusDirection::Right),
+            Some("bottom-right".to_owned())
+        );
+        // A pane that doesn't overlap on the perpendicular axis is never
+        // a step away, however near its edge: from bottom-right, up is a
+        // step straight to top, not sideways to bottom-left.
+        assert_eq!(
+            focus_neighbor(&panes, Some("bottom-right"), FocusDirection::Up),
+            Some("top".to_owned())
+        );
+        assert_eq!(
+            focus_neighbor(&panes, Some("bottom-right"), FocusDirection::Left),
+            Some("bottom-left".to_owned())
+        );
+    }
+
+    #[test]
+    fn focus_neighbor_needs_a_focused_pane_in_the_layout() {
+        // A zoomed window: one placement, no neighbor in any direction.
+        let panes = [pane("only", [0.0, 0.0, 1.0, 1.0])];
+        for direction in [
+            FocusDirection::Left,
+            FocusDirection::Right,
+            FocusDirection::Up,
+            FocusDirection::Down,
+        ] {
+            assert_eq!(focus_neighbor(&panes, Some("only"), direction), None);
+        }
+        // No focused pane, or one the layout no longer has: nothing to
+        // step from.
+        assert_eq!(focus_neighbor(&panes, None, FocusDirection::Left), None);
+        assert_eq!(
+            focus_neighbor(&panes, Some("gone"), FocusDirection::Down),
+            None
+        );
     }
 
     #[test]
@@ -919,15 +1100,51 @@ mod tests {
     #[test]
     fn binding_key_matches_keymap_spelling() {
         let key = binding_key(&keystroke(
-            "z",
+            "d",
             None,
             gpui::Modifiers {
                 control: true,
-                alt: true,
+                shift: true,
                 ..Default::default()
             },
         ));
-        assert_eq!(key, "ctrl+alt+z");
+        assert_eq!(key, "shift+ctrl+d");
+        assert_eq!(
+            binding_key(&keystroke(
+                "z",
+                None,
+                gpui::Modifiers {
+                    control: true,
+                    shift: true,
+                    ..Default::default()
+                }
+            )),
+            "shift+ctrl+z"
+        );
+        assert_eq!(
+            binding_key(&keystroke(
+                "p",
+                None,
+                gpui::Modifiers {
+                    control: true,
+                    alt: true,
+                    ..Default::default()
+                }
+            )),
+            "ctrl+alt+p"
+        );
+        assert_eq!(
+            binding_key(&keystroke(
+                "v",
+                None,
+                gpui::Modifiers {
+                    control: true,
+                    shift: true,
+                    ..Default::default()
+                }
+            )),
+            "shift+ctrl+v"
+        );
         assert_eq!(
             binding_key(&keystroke(
                 "right",
