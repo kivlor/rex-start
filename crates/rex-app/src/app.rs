@@ -7,13 +7,13 @@ use std::sync::Arc;
 
 use gpui::{
     div, prelude::*, px, rgb, Context, FocusHandle, KeyDownEvent, MouseButton, Pixels, Render,
-    Window,
+    Subscription, Window,
 };
 use rex_terminal::{row_text, Frame};
 
 use crate::{
     client::{default_local_keys, Client, ClientCmd, ClientEvent, Direction, KeyEvent},
-    terminal::TerminalElement,
+    terminal::{grid_for, TerminalElement},
     view::{SessionBrief, SessionView},
 };
 
@@ -51,6 +51,11 @@ pub struct RexApp {
     /// default set so keys work before the keymap arrives, and a failed
     /// keymap call keeps that fallback.
     ours: HashSet<String>,
+    /// Keeps the window-activation subscription alive.
+    _activation: Subscription,
+    /// The last grid claimed for each visible block, so repeat frames
+    /// (the common case) send nothing and only real changes do.
+    own_requests: HashMap<String, (u32, u32)>,
 }
 
 impl RexApp {
@@ -58,6 +63,18 @@ impl RexApp {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
         let events = client.events.clone();
+        // The prior art's policy (rex-linux): own the blocks the window
+        // shows when it's activated, give them up when it's deactivated.
+        // The observer fires once with the current state, which covers the
+        // app's own startup activation.
+        let _activation = cx.observe_window_activation(window, |app, window, _cx| {
+            if window.is_window_active() {
+                app.claim_panes(window);
+            } else {
+                app.send(ClientCmd::DisownAll);
+                app.own_requests.clear();
+            }
+        });
         let app = Self {
             focus_handle,
             client: Some(client),
@@ -70,6 +87,8 @@ impl RexApp {
             picker: None,
             status: "connecting".into(),
             ours: default_local_keys(),
+            _activation,
+            own_requests: HashMap::new(),
         };
         // Pump client events into entity updates until the client ends.
         cx.spawn(async move |this, cx| {
@@ -114,6 +133,7 @@ impl RexApp {
                 self.session_id = None;
                 self.session_label = None;
                 self.frames.clear();
+                self.own_requests.clear();
             }
             ClientEvent::Frame(block_id, frame) => {
                 // Stale frames from a just-aborted stream of a previous
@@ -145,6 +165,7 @@ impl RexApp {
             ClientEvent::Closed(reason) => {
                 self.status = format!("disconnected: {reason}");
                 self.client = None;
+                self.own_requests.clear();
             }
         }
         cx.notify();
@@ -303,6 +324,33 @@ impl RexApp {
         }
     }
 
+    /// Claims every visible pane at a grid that fits its pixels —
+    /// `session.own_block` then resize, per pane (the actor coalesces
+    /// repeats). Called on window activation and from `render`, so a
+    /// resize, a split, a zoom, or focus landing on a pane re-claims at
+    /// the new grid; only actual grid changes send anything.
+    fn claim_panes(&mut self, window: &mut Window) {
+        let viewport = window.viewport_size();
+        let (width, height) = (f32::from(viewport.width), f32::from(viewport.height));
+        let area = self.pane_at((width, height), 0.0, 0.0);
+        let mut seen: Vec<String> = Vec::new();
+        for (block_id, rect) in self.panes() {
+            let pane_w = (rect[2] as f32 * f32::from(area.size.width) - GUTTER).max(1.0);
+            let pane_h = (rect[3] as f32 * f32::from(area.size.height) - GUTTER).max(1.0);
+            let grid = grid_for(pane_w, pane_h);
+            seen.push(block_id.clone());
+            if self.own_requests.get(&block_id) != Some(&grid) {
+                self.own_requests.insert(block_id.clone(), grid);
+                self.send(ClientCmd::OwnBlock {
+                    block_id,
+                    cols: grid.0,
+                    rows: grid.1,
+                });
+            }
+        }
+        self.own_requests.retain(|id, _| seen.contains(id));
+    }
+
     fn pane_at(&self, viewport: (f32, f32), x: f32, y: f32) -> gpui::Bounds<Pixels> {
         gpui::Bounds::new(
             gpui::point(px(x), px(y + HEADER)),
@@ -313,6 +361,12 @@ impl RexApp {
 
 impl Render for RexApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // An active window owns what it shows, at grids that fit —
+        // activation, resize, split, zoom, and focus all pass through
+        // here, and claim_panes only sends actual grid changes.
+        if window.is_window_active() {
+            self.claim_panes(window);
+        }
         let viewport = window.viewport_size();
         let (width, height) = (f32::from(viewport.width), f32::from(viewport.height));
         let area = self.pane_at((width, height), 0.0, 0.0);

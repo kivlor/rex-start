@@ -47,6 +47,18 @@ pub enum ClientCmd {
     /// `client.key` in chunks: paste as text, split to stay under the
     /// server's `limits.max_message_bytes`. One call per chunk.
     Paste(String),
+    /// `session.own_block` (mode take) + `com.superlogical.terminal.resize`
+    /// with a grid that fits the pane: claim the block, then size it for
+    /// this window. Coalesced actor-side: a repeat of the block's current
+    /// grid sends nothing.
+    OwnBlock {
+        block_id: String,
+        cols: u32,
+        rows: u32,
+    },
+    /// `session.disown_block`: give up every claim in the current
+    /// session, handing sizing back without killing the block.
+    DisownAll,
 }
 
 /// One keyboard event for `client.key`: physical key name (W3C code in
@@ -310,6 +322,16 @@ struct Actor {
     /// The config hash of the last `client.keymap` result; a
     /// `keymap_changed` event with a different hash re-fetches it.
     keymap_hash: Option<String>,
+    /// This client's ID, from `session.bootstrap`. Ownership is exclusive:
+    /// it decides which blocks in `owners` are ours.
+    my_client_id: String,
+    /// Block ID -> owner in the current session, as own_block/disown_block
+    /// results and `block_owner_changed` events report it. `None` = no
+    /// owner. The view doesn't carry owners, so this map is the truth.
+    owners: HashMap<String, Option<String>>,
+    /// The last grid each block was resized to, so repeats are coalesced.
+    /// Cleared when a block's owner changes away from us.
+    last_grid: HashMap<String, (u32, u32)>,
 }
 
 /// Set `REX_APP_DEBUG=1` to see the actor's protocol progress on stderr:
@@ -359,6 +381,9 @@ async fn start_actor(
         current: None,
         max_message_bytes,
         keymap_hash: None,
+        my_client_id: String::new(),
+        owners: HashMap::new(),
+        last_grid: HashMap::new(),
     };
 
     // Declare the app's own actions and their default bindings, so the
@@ -380,6 +405,7 @@ async fn start_actor(
         bootstrap.attached_sessions.len(),
     );
     actor.sessions = bootstrap.attach_all.sessions.clone();
+    actor.my_client_id = bootstrap.client_id.clone().unwrap_or_default();
     let first = bootstrap.attached_sessions.first().cloned();
     let _ = actor
         .events
@@ -449,6 +475,11 @@ async fn run(
         }
     };
     let _ = event_tx.send(ClientEvent::Closed(reason)).await;
+    // The window closed while the connection is still good: hand every
+    // owned block back before the socket drops, so sizing passes on
+    // without the blocks dying. Best effort — on a connection error the
+    // call simply fails and the server's `lost` rule covers us.
+    let _ = actor.disown_all().await;
     // Dropping the actor aborts its stream tasks and closes every socket.
     Ok(())
 }
@@ -504,6 +535,12 @@ impl Actor {
                 self.send_key(key, prefix.as_deref()).await.map(|_| ())
             }
             ClientCmd::Paste(text) => self.paste(&text).await,
+            ClientCmd::OwnBlock {
+                block_id,
+                cols,
+                rows,
+            } => self.own_block(&block_id, cols, rows).await.map(|_| ()),
+            ClientCmd::DisownAll => self.disown_all().await.map(|_| ()),
         };
         if let Err(error) = outcome {
             self.notice(format!("{error}")).await;
@@ -713,6 +750,114 @@ impl Actor {
             .await
     }
 
+    /// `session.own_block` (mode `take`) followed, when the grid actually
+    /// changed, by `com.superlogical.terminal.resize` with `cols` x `rows`
+    /// and this client's cell metrics: the resize applies at once because
+    /// we just became the owner. Coalesced: if we already own the block
+    /// at this grid, nothing is sent. Ownership is exclusive but not
+    /// erroring: another client's claim doesn't fail this call — it wins
+    /// and moves the block to our grid; the `block_owner_changed` event is
+    /// how a losing client finds out and backs off.
+    async fn own_block(&mut self, block_id: &str, cols: u32, rows: u32) -> Result<()> {
+        let session_id = self
+            .session_id()
+            .ok_or_else(|| anyhow!("no session"))?
+            .to_owned();
+        let ours = self
+            .owners
+            .get(block_id)
+            .and_then(|owner| owner.as_deref())
+            .is_some_and(|owner| owner == self.my_client_id.as_str());
+        if ours && self.last_grid.get(block_id) == Some(&(cols, rows)) {
+            return Ok(());
+        }
+        let result = self
+            .rpc
+            .call(
+                "session.own_block",
+                json!({
+                    "session_id": session_id,
+                    "block_ids": [block_id],
+                    "mode": "take",
+                }),
+            )
+            .await?;
+        self.record_owners(&result, &[block_id]);
+        debug!(
+            "own_block {block_id} at {cols}x{rows}: owner={}",
+            self.owners
+                .get(block_id)
+                .and_then(|o| o.clone())
+                .unwrap_or_default(),
+        );
+        // Only resize when the grid differs from the last one applied.
+        if self.last_grid.get(block_id) == Some(&(cols, rows)) {
+            return Ok(());
+        }
+        self.rpc
+            .call(
+                "com.superlogical.terminal.resize",
+                json!({
+                    "session_id": session_id,
+                    "block_id": block_id,
+                    "args": {
+                        "columns": cols,
+                        "rows": rows,
+                        "cell_width_px": crate::terminal::CELL_W_PX as u32,
+                        "cell_height_px": crate::terminal::CELL_H_PX as u32,
+                    },
+                }),
+            )
+            .await?;
+        self.last_grid.insert(block_id.to_owned(), (cols, rows));
+        debug!("resize {block_id} to {cols}x{rows}");
+        Ok(())
+    }
+
+    /// `session.disown_block` with no `block_ids`: give up every claim in
+    /// the current session. The blocks keep running; sizing passes to the
+    /// next client in line for each ("the block follows its owner").
+    /// Nothing to do when we own nothing.
+    async fn disown_all(&mut self) -> Result<()> {
+        if self.current.is_none() {
+            return Ok(());
+        }
+        let ours = self
+            .owners
+            .values()
+            .any(|owner| owner.as_deref() == Some(self.my_client_id.as_str()));
+        if !ours && self.last_grid.is_empty() {
+            return Ok(());
+        }
+        let session_id = self
+            .session_id()
+            .ok_or_else(|| anyhow!("no session"))?
+            .to_owned();
+        let result = self
+            .rpc
+            .call("session.disown_block", json!({"session_id": session_id}))
+            .await?;
+        self.record_owners(&result, &[]);
+        self.last_grid.clear();
+        debug!("disowned every block in {session_id}");
+        Ok(())
+    }
+
+    /// Records the owners an own_block/disown_block result reports for
+    /// `block_ids` (or every block in the result when empty).
+    fn record_owners(&mut self, result: &Value, block_ids: &[&str]) {
+        for entry in result["blocks"].as_array().into_iter().flatten() {
+            let Some(block_id) = entry["block_id"].as_str() else {
+                continue;
+            };
+            if !block_ids.is_empty() && !block_ids.contains(&block_id) {
+                continue;
+            }
+            let owner = entry["owner"].as_str().map(str::to_owned);
+            self.owners.insert(block_id.to_owned(), owner);
+        }
+    }
+
     /// `session.focus_block`: focus one block.
     async fn focus_block(&mut self, block_id: &str) -> Result<Value> {
         let session_id = self
@@ -826,6 +971,11 @@ impl Actor {
             view,
             streams: HashMap::new(),
         });
+        // Ownership belongs to the session: a new current session starts
+        // with a clean slate. (The view doesn't report owners; own/disown
+        // results and `block_owner_changed` events keep the map current.)
+        self.owners.clear();
+        self.last_grid.clear();
         self.sync_streams().await;
     }
 
@@ -993,6 +1143,28 @@ impl Actor {
                             debug!("view refresh failed: {error}");
                             self.notice(format!("view refresh failed: {error}")).await;
                         }
+                    }
+                }
+                if event["type"] == "block_owner_changed" {
+                    let payload = &event["payload"];
+                    let block_id = payload["block_id"].as_str().unwrap_or_default().to_owned();
+                    let owner = payload["owner"].as_str().map(str::to_owned);
+                    let previous = payload["previous"].as_str().map(str::to_owned);
+                    let reason = payload["reason"].as_str().unwrap_or_default().to_owned();
+                    self.owners.insert(block_id.clone(), owner.clone());
+                    debug!(
+                            "block_owner_changed: {block_id} owner={owner:?} previous={previous:?} reason={reason}"
+                    );
+                    // Exclusivity: someone else took a block we owned. Back
+                    // off — forget our grid so a later claim re-resizes —
+                    // and surface it rather than fighting over the block.
+                    if previous.as_deref() == Some(self.my_client_id.as_str())
+                        && owner.as_deref() != Some(self.my_client_id.as_str())
+                    {
+                        self.last_grid.remove(&block_id);
+                        let who = owner.as_deref().unwrap_or("no one");
+                        self.notice(format!("block {block_id} taken by {who}"))
+                            .await;
                     }
                 }
                 // block_created, window_created, focus changes, and the
