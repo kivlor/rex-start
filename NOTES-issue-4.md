@@ -187,3 +187,43 @@ end)
   first).
 - `prefix` (key sequences) is plumbed through ClientCmd but the UI never
   builds one; it exists for when the app starts waiting on sequences.
+
+## Review fix — paste chunks sized by JSON-encoded length
+
+Review found a defect in `Actor::paste`: chunks were sized by **raw UTF-8
+byte count** (`max_message_bytes - 1 KiB`), but the request is JSON and
+serde_json escapes `"`, `\` and control characters — `\n` doubles to 2
+bytes, other control bytes become 6-byte `\u00XX`. A newline-heavy paste
+expanded past `limits.max_message_bytes` (600 KiB of newlines → ~1.2 MB
+payload), and the server closed the control connection with 1009
+(docs/API-rev19.md "Message Size"), disconnecting the whole app. On a
+64 KiB-floor server it failed even sooner. The earlier live test (85 KB
+plain ASCII) passed only because ASCII needs no escaping.
+
+### Fix
+
+- `rex_conn::chunk_utf8` replaced by `rex_conn::chunk_json_safe(text,
+  max_json_bytes)` (crates/rex-conn/src/lib.rs): greedy accumulation per
+  character, counting each at its JSON string-literal cost (2 for `"`,
+  `\`, `\n`, `\t`, `\r`, `\b`, `\f`; 6 for other control chars < 0x20;
+  UTF-8 length otherwise, plus the surrounding quotes). A single
+  character larger than the whole budget still goes out alone (no
+  infinite loop). Nothing else used `chunk_utf8`, so it's gone.
+- `Actor::paste` keeps the 1 KiB envelope margin but now budgets by
+  encoded length; `examples/client_key.rs` chunking follows, with a new
+  `REX_PASTE_NEWLINES` mode that pastes a newline-heavy blob (the
+  regression case) and polls for the end marker (a very large echo
+  takes cat more than one fixed 400 ms sleep).
+
+### Evidence
+
+- Unit: new `chunk_json_safe_*` tests in rex-conn (5) and rex-app (4),
+  including `chunk_json_safe_paste_stays_within_budget` — a 600 KiB
+  newline + control-char blob chunks so every chunk's
+  `serde_json::to_string` stays under the 1 MiB-minus-margin budget.
+- Live (local Rex server, 1 MiB limit): plain run passes; then
+  `REX_PASTE_NEWLINES=614400` — 614421 raw bytes (~1.23 MB JSON) sent
+  as 2 chunks, all accepted, no 1009, connection stayed up through the
+  later ctrl+d / arrow-key checks, end marker present on screen.
+  Cleanup: `rex kill keytest-700926 keytest-701514`; no
+  probe-stream-*.bin created.
