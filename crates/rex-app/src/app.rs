@@ -176,6 +176,12 @@ impl RexApp {
             ClientEvent::Notice(text) => {
                 self.status = text;
             }
+            ClientEvent::Reconnecting => {
+                self.status = "reconnecting…".into();
+            }
+            ClientEvent::Reconnected => {
+                self.status = "reconnected".into();
+            }
             ClientEvent::Closed(reason) => {
                 self.status = format!("disconnected: {reason}");
                 self.client = None;
