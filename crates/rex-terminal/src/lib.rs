@@ -45,6 +45,8 @@ pub enum Error {
     NotASnapshot,
     #[error("snapshot exceeded {0} bytes without decoding")]
     SnapshotTooLarge(usize),
+    #[error("snapshot still undecodable after {0} bytes; likely corrupt")]
+    SnapshotCorrupt(usize),
 }
 
 /// An 8-bit RGB color.
@@ -166,6 +168,9 @@ impl Replica {
                         if buffer.len() > MAX_SNAPSHOT_BYTES {
                             return Err(Error::SnapshotTooLarge(MAX_SNAPSHOT_BYTES));
                         }
+                        if buffer.len() > REALISTIC_SNAPSHOT_BYTES {
+                            return Err(Error::SnapshotCorrupt(buffer.len()));
+                        }
                         return Ok(Fed::default());
                     }
                 }
@@ -280,9 +285,17 @@ impl Live {
     }
 }
 
-/// The cap on a buffered snapshot before giving up: real snapshots are a few
-/// kilobytes to a few megabytes.
+/// The cap on a buffered snapshot before giving up: an absolute memory
+/// guard, far above anything the protocol produces.
 const MAX_SNAPSHOT_BYTES: usize = 256 << 20;
+
+/// A snapshot that starts with the magic but still fails to decode after
+/// this many bytes is corrupt rather than truncated: real snapshots are a
+/// few kilobytes to a few megabytes (docs/API-rev19.md), so a truncated one
+/// would long since have decoded. Without this bound, a corrupt buffer is
+/// indistinguishable from a truncated one and would spin as "wait for more
+/// bytes" all the way to [`MAX_SNAPSHOT_BYTES`].
+const REALISTIC_SNAPSHOT_BYTES: usize = 64 << 20;
 
 /// Restores the snapshot at the start of `buffer`, returning the terminal and
 /// how many bytes the snapshot occupies, or nothing while bytes are still
@@ -509,6 +522,26 @@ mod tests {
             replica.feed(b"plain output, no snapshot"),
             Err(Error::NotASnapshot)
         ));
+    }
+
+    #[test]
+    fn gives_up_on_a_corrupt_snapshot_instead_of_waiting_to_the_cap() {
+        // Magic that never decodes: indistinguishable from a truncated
+        // snapshot, so it must be declared corrupt once it passes any
+        // realistic snapshot size, not buffered to the 256 MiB cap.
+        let mut replica = Replica::new(1).unwrap();
+        let chunk = vec![b'x'; 8 << 20];
+        let mut fed = 8 << 20; // magic + first chunk
+        replica.feed(b"GHOSTSNP").unwrap();
+        assert!(replica.feed(&chunk).is_ok());
+        while fed <= REALISTIC_SNAPSHOT_BYTES {
+            if let Err(Error::SnapshotCorrupt(len)) = replica.feed(&chunk) {
+                assert!(len > REALISTIC_SNAPSHOT_BYTES);
+                return;
+            }
+            fed += chunk.len();
+        }
+        panic!("corrupt snapshot never reported ({} bytes fed)", fed);
     }
 
     #[test]

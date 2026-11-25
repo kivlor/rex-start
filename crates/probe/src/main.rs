@@ -249,7 +249,7 @@ async fn main() -> Result<()> {
     println!("data stream open (channel nonce {nonce})");
 
     // ---- stream until child_exited or the deadline ----
-    let (tx, mut rx) = mpsc::channel::<u64>(1);
+    let (tx, mut rx) = mpsc::channel::<i64>(1);
     let stream_path = format!("probe-stream-{}.bin", args.label);
     let stream_path_task = stream_path.clone();
     let data_task = tokio::spawn(async move {
@@ -262,7 +262,7 @@ async fn main() -> Result<()> {
                 Some(Ok(Message::Binary(b))) => {
                     use std::io::Write;
                     out.write_all(&b).expect("write stream file");
-                    let mut exits: Vec<u64> = Vec::new();
+                    let mut exits: Vec<i64> = Vec::new();
                     filter.feed(&b, |piece| {
                         if let rex_terminal::Piece::Message(v) = piece {
                             match v {
@@ -277,7 +277,9 @@ async fn main() -> Result<()> {
                                 }
                                 rex_terminal::RexMessage::ChildExited { exit_code } => {
                                     eprintln!("[rex1] child_exited {exit_code}");
-                                    exits.push(exit_code.max(0) as u64);
+                                    // i64 as-is: negative codes are signal
+                                    // deaths, and `.max(0)` would hide them.
+                                    exits.push(exit_code);
                                 }
                                 rex_terminal::RexMessage::Unknown => {
                                     eprintln!("[rex1] (unknown type)");

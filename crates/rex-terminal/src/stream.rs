@@ -68,6 +68,8 @@ pub enum Piece<'a> {
 pub struct StreamFilter {
     nonce: String,
     pending: Vec<u8>,
+    /// Bytes without a terminator after which an introducer is given up on.
+    max_message_bytes: usize,
 }
 
 impl StreamFilter {
@@ -76,6 +78,18 @@ impl StreamFilter {
         Self {
             nonce: nonce.to_string(),
             pending: Vec::new(),
+            max_message_bytes: MAX_MESSAGE_BYTES,
+        }
+    }
+
+    /// A filter with a smaller give-up cap, so tests can exercise the
+    /// oversized-message path without feeding megabytes.
+    #[cfg(test)]
+    fn with_max_bytes(nonce: u64, max_message_bytes: usize) -> Self {
+        Self {
+            nonce: nonce.to_string(),
+            pending: Vec::new(),
+            max_message_bytes,
         }
     }
 
@@ -111,16 +125,18 @@ impl StreamFilter {
             let Some(end) = find(&buffer[body_start..], TERMINATOR).map(|at| body_start + at)
             else {
                 // Introducer without a terminator yet.
-                if buffer.len() - start > MAX_MESSAGE_BYTES {
+                if buffer.len() - start > self.max_message_bytes {
                     // Give up on it: this is program output that merely
-                    // starts like a message.
-                    on_piece(Piece::Output(&buffer[start..]));
-                    let tail = buffer[start..].to_vec();
-                    self.pending = tail;
-                } else {
-                    let held = buffer[start..].to_vec();
-                    self.pending = held;
+                    // starts like a message. Emit the introducer itself and
+                    // rescan the remainder as an ordinary stream, so later
+                    // genuine messages are still found and no bytes are ever
+                    // emitted or held twice.
+                    on_piece(Piece::Output(&buffer[start..body_start]));
+                    position = body_start;
+                    continue;
                 }
+                let held = buffer[start..].to_vec();
+                self.pending = held;
                 return;
             };
             match parse_message(&buffer[body_start..end], &self.nonce) {
@@ -162,27 +178,45 @@ fn partial_suffix(bytes: &[u8], needle: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
-/// Scans raw stream bytes for the first `rex1` APC and returns its decimal
-/// nonce. Used by `replay` when the WELCOME's nonce wasn't recorded: the
-/// server's first message (a resize) comes right after the snapshot, so the
-/// first well-formed APC in the file is the channel's own. Returns nothing
-/// when the file holds no APC at all.
+/// Scans raw stream bytes for the channel nonce. Prefers the first
+/// `rex1` APC whose JSON carries a known message type (resize, theme,
+/// child_exited): the server's first message, a resize, comes right after
+/// the snapshot, while a program inside it may have printed a look-alike.
+/// Falls back to the first APC with a decimal nonce if none parses. Returns
+/// nothing when the file holds no APC at all.
 pub fn detect_nonce(bytes: &[u8]) -> Option<u64> {
+    let mut fallback = None;
     let mut from = 0;
     while let Some(hit) = find(&bytes[from..], INTRODUCER).map(|at| from + at) {
         let body_start = hit + INTRODUCER.len();
-        if let Some(end) = find(&bytes[body_start..], TERMINATOR).map(|at| body_start + at) {
-            if let Ok(body) = std::str::from_utf8(&bytes[body_start..end]) {
-                if let Some((given, _)) = body.split_once(';') {
-                    if let Ok(nonce) = given.parse::<u64>() {
-                        return Some(nonce);
-                    }
+        let Some(end) = find(&bytes[body_start..], TERMINATOR).map(|at| body_start + at) else {
+            from = body_start;
+            continue;
+        };
+        let body = &bytes[body_start..end];
+        if let Some((given, json)) = utf8(body).and_then(|b| b.split_once(';')) {
+            if let Ok(nonce) = given.parse::<u64>() {
+                if known_type(json) {
+                    return Some(nonce);
                 }
+                fallback = fallback.or(Some(nonce));
             }
         }
-        from = body_start;
+        from = end + TERMINATOR.len();
     }
-    None
+    fallback
+}
+
+fn utf8(bytes: &[u8]) -> Option<&str> {
+    std::str::from_utf8(bytes).ok()
+}
+
+/// True when `json` is a message object with a type this version knows.
+fn known_type(json: &str) -> bool {
+    serde_json::from_str::<Value>(json)
+        .ok()
+        .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|kind| matches!(kind.as_str(), "resize" | "theme" | "child_exited"))
 }
 
 #[cfg(test)]
@@ -272,5 +306,65 @@ mod tests {
         let bytes = b"junk\x1b_rex1;12433518746600474347;{\"type\":\"resize\",\"cols\":80,\"rows\":24}\x1b\\more";
         assert_eq!(detect_nonce(bytes), Some(12_433_518_746_600_474_347));
         assert_eq!(detect_nonce(b"no apc here"), None);
+    }
+
+    #[test]
+    fn detect_nonce_prefers_a_known_type_over_an_earlier_look_alike() {
+        // A program printed a look-alike APC (unknown type) before the
+        // server's genuine resize; the genuine one must win.
+        let bytes = b"\x1b_rex1;7;{\"type\":\"prog-thing\"}\x1b\\x\x1b_rex1;42;{\"type\":\"resize\",\"cols\":80,\"rows\":24}\x1b\\";
+        assert_eq!(detect_nonce(bytes), Some(42));
+        // With no known-type APC anywhere, the first decimal nonce is kept
+        // as a fallback.
+        assert_eq!(detect_nonce(b"\x1b_rex1;9;{nope}\x1b\\"), Some(9));
+    }
+
+    #[test]
+    fn gives_up_on_an_oversized_introducer_without_duplicating_output() {
+        // An introducer followed by terminator-less bytes well past the
+        // cap, then a genuine message, fed in small chunks.
+        let mut input: Vec<u8> = b"junk\x1b_rex1;".to_vec();
+        input.extend(std::iter::repeat_n(b'x', 512));
+        let genuine = b"\x1b_rex1;9;{\"type\":\"child_exited\",\"exit_code\":3}\x1b\\tail";
+        let full: Vec<u8> = [&input, genuine.as_slice()].concat();
+        // What should come back out: everything except the consumed genuine
+        // message — the given-up introducer and its junk included, once.
+        let mut expected = input.clone();
+        expected.extend_from_slice(b"tail");
+
+        let mut filter = StreamFilter::with_max_bytes(9, 256);
+        let mut output = Vec::new();
+        let mut messages = Vec::new();
+        for chunk in full.chunks(7) {
+            filter.feed(chunk, |piece| match piece {
+                Piece::Output(bytes) => output.extend_from_slice(bytes),
+                Piece::Message(message) => messages.push(message),
+            });
+        }
+        // (a) Every input byte accounted for exactly once: emitted once,
+        // or consumed as the one genuine message.
+        assert_eq!(output, expected);
+        // (c) The genuine message after the given-up introducer is found.
+        assert_eq!(messages, [RexMessage::ChildExited { exit_code: 3 }]);
+
+        // (b) Later feeds keep the stream ordinary: nothing re-emitted,
+        // nothing dropped.
+        let tail = b"after\x1b_rex1;9;{\"type\":\"resize\",\"cols\":10,\"rows\":2}\x1b\\!";
+        filter.feed(tail, |piece| match piece {
+            Piece::Output(bytes) => output.extend_from_slice(bytes),
+            Piece::Message(message) => messages.push(message),
+        });
+        expected.extend_from_slice(b"after!");
+        assert_eq!(output, expected);
+        assert_eq!(
+            messages[1..],
+            [RexMessage::Resize {
+                cols: 10,
+                rows: 2,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                owner: None
+            }]
+        );
     }
 }
