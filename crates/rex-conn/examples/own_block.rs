@@ -363,8 +363,8 @@ async fn stream_resizes(
     ticket: &[u8],
     resize_tx: mpsc::UnboundedSender<(u32, u32, u32, u32)>,
 ) -> Result<()> {
-    let (mut ws, nonce) = open_data(socket, ticket).await?;
-    let mut replica = Replica::new(nonce)?;
+    let (mut ws, welcome) = open_data(socket, ticket).await?;
+    let mut replica = Replica::new(welcome.nonce)?;
     while let Some(message) = ws.next().await {
         let bytes = match message? {
             Message::Binary(bytes) => bytes,

@@ -118,8 +118,8 @@ async fn main() -> Result<()> {
 
     // ---- data connection ----
     let ticket = rex_conn::data_ticket(&mut rpc, &session_id, &block_id).await?;
-    let (data, nonce) = open_data(&args.socket, &ticket).await?;
-    println!("data stream open (channel nonce {nonce})");
+    let (data, welcome) = open_data(&args.socket, &ticket).await?;
+    println!("data stream open (channel nonce {})", welcome.nonce);
 
     // ---- stream until child_exited or the deadline ----
     let (tx, mut rx) = mpsc::channel::<i64>(1);
@@ -130,7 +130,7 @@ async fn main() -> Result<()> {
         let mut out = std::fs::File::create(&stream_path_task).expect("create stream file");
         // rex1 APC messages: ESC _ rex1;<nonce>;<json> ESC \
         // rex-terminal's filter skips look-alikes whose nonce doesn't match.
-        let mut filter = rex_terminal::StreamFilter::new(nonce);
+        let mut filter = rex_terminal::StreamFilter::new(welcome.nonce);
         loop {
             match data.next().await {
                 Some(Ok(Message::Binary(b))) => {

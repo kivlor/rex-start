@@ -9,13 +9,14 @@
 //! closes the sockets. Nothing here ever destroys a session: sessions and
 //! their programs keep running server-side.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use futures_util::StreamExt;
-use rex_conn::{connect, hello, Rpc};
+use rex_conn::{connect, hello, hello_with_token, Rpc};
 use rex_terminal::Replica;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -145,6 +146,12 @@ pub enum ClientEvent {
     /// up, detached, or lost its connection and we were in line. The UI
     /// re-claims at its own fitting grid.
     BlockReturned(String),
+    /// The control connection dropped; the actor is reconnecting (with
+    /// the reconnect token) and will re-attach, refresh, and re-own.
+    Reconnecting,
+    /// The control connection is back: same client, re-attached and
+    /// re-owned. Any stream whose resume window lapsed started over.
+    Reconnected,
     /// The control connection ended; the UI can say so.
     Closed(String),
 }
@@ -311,6 +318,16 @@ fn key_is_ours(bindings: &[Value], default: &str) -> bool {
     first_action.is_some_and(|action| OUR_ACTIONS.contains(&action))
 }
 
+/// A stream task's request for a fresh `data.connect` ticket. The
+/// actor owns the one control Rpc, so stream tasks ask it through this
+/// channel and wait on the oneshot (the start-over path after a refused
+/// RESUME, and after a 1013 `data reconnect required`).
+pub type TicketRequest = (
+    String,
+    String,
+    tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
+);
+
 /// The session the window is showing, plus its live data streams.
 struct Current {
     session: SessionBrief,
@@ -323,6 +340,10 @@ struct Actor {
     socket: String,
     rpc: Rpc,
     events: async_channel::Sender<ClientEvent>,
+    /// Stream tasks' ticket requests (see [`TicketRequest`]).
+    ticket_rx: mpsc::UnboundedReceiver<TicketRequest>,
+    /// The sending half, cloned into each stream task.
+    ticket_tx: mpsc::UnboundedSender<TicketRequest>,
     sessions: Vec<SessionBrief>,
     current: Option<Current>,
     /// The welcome's `limits.max_message_bytes`: any larger request would
@@ -356,25 +377,37 @@ macro_rules! debug {
 /// Connects, handshakes, bootstraps, and attaches the preferred session:
 /// everything before the main loop. The caller turns any failure into
 /// `ClientEvent::Closed`, so the window never hangs on "connecting".
+/// Also hands back the reconnect inputs: the `client_hello` json (the
+/// identity every reconnect must repeat) and the welcome's reconnect
+/// token (never logged).
 async fn start_actor(
     socket: &str,
     preferred: Option<&str>,
     events: async_channel::Sender<ClientEvent>,
-) -> Result<(Actor, mpsc::UnboundedReceiver<Value>)> {
+) -> Result<(Actor, mpsc::UnboundedReceiver<Value>, Value, Option<String>)> {
+    let client_hello =
+        json!({"kind": "app", "name": "rex-app", "version": env!("CARGO_PKG_VERSION")});
     let ws = connect(socket, "/api/control", "rex.control.v1").await?;
-    let (ws, _welcome) = hello(
-        ws,
-        json!({"kind": "app", "name": "rex-app", "version": env!("CARGO_PKG_VERSION")}),
-    )
-    .await?;
+    let (ws, welcome) = hello(ws, client_hello.clone()).await?;
+    // The welcome's reconnect token continues this client across a drop
+    // ("Reconnecting" in the API doc). Every welcome carries a NEW one;
+    // keep the newest, never log it. A token the server doesn't accept
+    // (60s gone, or a restarted server that forgot us) silently starts
+    // a new client — the re-attach below picks up the new client id.
+    let control_token = welcome["client"]["reconnect_token"]
+        .as_str()
+        .map(str::to_owned);
     // Requests larger than this close the connection, so keep every
     // paste chunk's whole JSON message under it. 1 MiB here; every
     // server guarantees at least 64 KiB.
-    let max_message_bytes = _welcome["limits"]["max_message_bytes"]
+    let max_message_bytes = welcome["limits"]["max_message_bytes"]
         .as_u64()
         .unwrap_or(64 * 1024);
     debug!("max_message_bytes: {max_message_bytes}");
 
+    // Stream tasks ask the actor for fresh tickets through this channel
+    // (the actor owns the one control Rpc).
+    let (ticket_tx, ticket_rx) = mpsc::unbounded_channel::<TicketRequest>();
     // Events that arrive while a call is waiting land in this queue; the
     // main loop drains it alongside the socket.
     let (queued_tx, queued_rx) = mpsc::unbounded_channel::<Value>();
@@ -386,6 +419,8 @@ async fn start_actor(
         socket: socket.to_owned(),
         rpc,
         events,
+        ticket_rx,
+        ticket_tx,
         sessions: Vec::new(),
         current: None,
         max_message_bytes,
@@ -426,7 +461,7 @@ async fn start_actor(
     if let Some(attached) = first {
         actor.set_current(attached).await;
     }
-    Ok((actor, queued_rx))
+    Ok((actor, queued_rx, client_hello, control_token))
 }
 
 async fn run(
@@ -437,8 +472,11 @@ async fn run(
     event_tx: async_channel::Sender<ClientEvent>,
 ) -> Result<()> {
     // Every way the startup can fail funnels through here: the window
-    // gets a Closed reason instead of staying on "connecting".
-    let (mut actor, mut queued_rx) =
+    // gets a Closed reason instead of staying on "connecting". The
+    // startup also hands back the reconnect inputs: `client_hello` (the
+    // identity every reconnect must repeat) and the latest
+    // `control_token` (updated on every welcome, never logged).
+    let (mut actor, mut queued_rx, client_hello, mut control_token) =
         match start_actor(&socket, preferred.as_deref(), event_tx.clone()).await {
             Ok(started) => started,
             Err(error) => {
@@ -455,32 +493,68 @@ async fn run(
         }
     }
 
-    // ---- main loop: commands, events read directly, queued events ----
-    let reason = loop {
-        tokio::select! {
-            cmd = cmd_rx.recv() => match cmd {
-                Ok(cmd) => actor.command(cmd).await,
-                // Every sender dropped: the window closed. Leave the server
-                // alone and end the actor.
-                Err(_) => break "window closed".to_owned(),
-            },
-            queued = queued_rx.recv() => {
-                if let Some(event) = queued {
-                    actor.event(&event).await;
-                }
-            }
-            message = actor.rpc.ws.next() => match message {
-                Some(Ok(Message::Text(text))) => {
-                    if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                        if value["type"] == "event" {
-                            actor.event(&value["payload"]).await;
-                        }
+    // ---- main loop: commands, events, tickets — with reconnect ----
+    // The outer loop reconnects the control connection when it drops;
+    // the window closing (all senders gone) is the only way out that
+    // doesn't come back.
+    let reason = 'session: loop {
+        let dropped = loop {
+            tokio::select! {
+                cmd = cmd_rx.recv() => match cmd {
+                    Ok(cmd) => actor.command(cmd).await,
+                    // Every sender dropped: the window closed. Leave the
+                    // server alone and end the actor.
+                    Err(_) => break 'session "window closed".to_owned(),
+                },
+                // A stream task needs a fresh data.connect ticket (the
+                // start-over path after a refused RESUME or a 1013).
+                ticket = actor.ticket_rx.recv() => {
+                    if let Some((session_id, block_id, reply)) = ticket {
+                        let result =
+                            rex_conn::data_ticket(&mut actor.rpc, &session_id, &block_id).await;
+                        let _ = reply.send(result);
                     }
                 }
-                Some(Ok(_)) => {}
-                Some(Err(error)) => break format!("control connection error: {error}"),
-                None => break "control connection closed".to_owned(),
-            },
+                queued = queued_rx.recv() => {
+                    if let Some(event) = queued {
+                        actor.event(&event).await;
+                    }
+                }
+                message = actor.rpc.ws.next() => match message {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                            if value["type"] == "event" {
+                                actor.event(&value["payload"]).await;
+                            }
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => break format!("control connection error: {error}"),
+                    None => break "control connection closed".to_owned(),
+                },
+            }
+        };
+        // The control connection dropped (the window is still open):
+        // reconnect with the token, then catch up on what we missed.
+        debug!("control connection lost: {dropped}; reconnecting");
+        let _ = event_tx.send(ClientEvent::Reconnecting).await;
+        match reconnect_control(&socket, &client_hello, control_token.as_deref()).await {
+            Ok((ws, welcome)) => {
+                // The new welcome carries a NEW token: keep the newest.
+                control_token = welcome["client"]["reconnect_token"]
+                    .as_str()
+                    .map(str::to_owned);
+                let (queued_tx, qrx) = mpsc::unbounded_channel::<Value>();
+                queued_rx = qrx;
+                actor.rpc = Rpc::new(ws, move |event: &Value| {
+                    let _ = queued_tx.send(event.clone());
+                });
+                let resumed = welcome["client"]["resumed"].as_bool().unwrap_or(false);
+                debug!("control reconnected (resumed: {resumed})");
+                let _ = event_tx.send(ClientEvent::Reconnected).await;
+                actor.catch_up().await;
+            }
+            Err(error) => break format!("could not reconnect within the retry budget: {error}"),
         }
     };
     let _ = event_tx.send(ClientEvent::Closed(reason)).await;
@@ -501,6 +575,36 @@ fn revision_is_newer(new: u64, known: Option<u64>) -> bool {
 
 fn attached_to_pair(attached: &Attached) -> (SessionBrief, SessionView) {
     (attached.session.clone(), attached.view.clone())
+}
+
+/// Reconnects the control connection, carrying the latest reconnect
+/// token so the client keeps its id ("Reconnecting" in the API doc).
+/// Backoff: 0.5s doubling to 5s, bounded to about three minutes so a
+/// server that stays down surfaces as a failure instead of a silent
+/// hang. The token is an Option because a server that never gave one
+/// (or a restarted server that forgot us) must still let us connect
+/// fresh.
+async fn reconnect_control(
+    socket: &str,
+    client_hello: &Value,
+    control_token: Option<&str>,
+) -> Result<(rex_conn::Ws, Value)> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    let mut backoff = Duration::from_millis(500);
+    loop {
+        if let Ok(ws) = connect(socket, "/api/control", "rex.control.v1").await {
+            if let Ok((ws, welcome)) =
+                hello_with_token(ws, client_hello.clone(), control_token).await
+            {
+                return Ok((ws, welcome));
+            }
+        }
+        if std::time::Instant::now() + backoff > deadline {
+            bail!("server unreachable for ~3 minutes");
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(5));
+    }
 }
 
 impl Actor {
@@ -1020,6 +1124,80 @@ impl Actor {
         self.sync_streams().await;
     }
 
+    /// Catches up after a control reconnect. Events that happened while
+    /// we had no connection are lost (the API doc says so), so state is
+    /// re-derived from calls: the session list, a fresh `session.attach`
+    /// for the current session (its result is the current view — the
+    /// response's seq has already skipped any events it includes), and
+    /// an explicit re-claim of the blocks we still own. The server's
+    /// `restore` rule already hands an owner its blocks back on
+    /// reconnect; the explicit take also re-applies our grid, and covers
+    /// a lost client id (token expired → new client).
+    async fn catch_up(&mut self) {
+        match self.rpc.call("session.list", json!({})).await {
+            Ok(listed) => {
+                if let Ok(sessions) =
+                    serde_json::from_value::<Vec<SessionBrief>>(listed["sessions"].clone())
+                {
+                    self.sessions = sessions;
+                    self.emit_sessions().await;
+                }
+            }
+            Err(error) => debug!("session.list after reconnect failed: {error}"),
+        }
+        let Some((session_brief, current_view)) = self
+            .current
+            .as_ref()
+            .map(|c| (c.session.clone(), c.view.clone()))
+        else {
+            return;
+        };
+        let session_id = session_brief.session_id.clone();
+        match self
+            .rpc
+            .call("session.attach", json!({"session_id": session_id}))
+            .await
+        {
+            Ok(attached) => {
+                if let Some(id) = attached["client_id"].as_str() {
+                    self.my_client_id = id.to_owned();
+                }
+                if let Ok(view) = serde_json::from_value::<SessionView>(attached["view"].clone()) {
+                    if view.revision >= current_view.revision {
+                        debug!(
+                            "re-attached: view revision {} (was {})",
+                            view.revision, current_view.revision
+                        );
+                        let _ = self
+                            .events
+                            .send(ClientEvent::View(session_brief.clone(), view.clone()))
+                            .await;
+                        if let Some(c) = &mut self.current {
+                            c.view = view;
+                        }
+                        self.sync_streams().await;
+                    }
+                }
+            }
+            Err(error) => debug!("re-attach failed: {error}"),
+        }
+        // Re-claim what the owners map says is still ours, with the grid
+        // we last set. Clearing last_grid first forces the resize back out
+        // (own_block is coalesced).
+        let mine: Vec<(String, (u32, u32))> = self
+            .owners
+            .iter()
+            .filter(|(_, owner)| owner.as_deref() == Some(self.my_client_id.as_str()))
+            .filter_map(|(block, _)| self.last_grid.get(block).map(|g| (block.clone(), *g)))
+            .collect();
+        for (block_id, (cols, rows)) in mine {
+            self.last_grid.remove(&block_id);
+            if let Err(error) = self.own_block(&block_id, cols, rows).await {
+                debug!("re-own {block_id} failed: {error}");
+            }
+        }
+    }
+
     /// Refreshes the current session's view when the server says it
     /// changed. A revision at or below ours describes a change we have.
     async fn refresh_view(&mut self) -> Result<()> {
@@ -1097,9 +1275,18 @@ impl Actor {
             };
             let socket = self.socket.clone();
             let events = self.events.clone();
+            let tickets = self.ticket_tx.clone();
             let block_id_task = block_id.clone();
             let task = tokio::task::spawn_local(async move {
-                let _ = stream_block(&socket, &ticket, &block_id_task, events).await;
+                let _ = stream_block(
+                    &socket,
+                    &ticket,
+                    &session_id,
+                    &block_id_task,
+                    tickets,
+                    events,
+                )
+                .await;
             });
             if let Some(current) = self.current.as_mut() {
                 current.streams.insert(block_id, task);
@@ -1236,69 +1423,262 @@ impl Actor {
     }
 }
 
-/// Feeds one block's data stream into a replica and publishes its frames.
+/// How a data connection ended and what to do about it ("When a Data
+/// Connection Closes" in the API doc).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamEnd {
+    /// 1000 (the stream ended) or 4000 (`block closed`): stop the task.
+    Over,
+    /// Anything else (1001 keepalive, 1001 provider canceled, 1008, 1011,
+    /// an unclean drop): the server holds the stream ~60s for a RESUME.
+    Resume,
+    /// 1013 `data reconnect required`: retained output overflowed while
+    /// we were away; start a new stream with a new ticket.
+    Restart,
+}
+
+fn classify_close(code: u16) -> StreamEnd {
+    match code {
+        1000 | 4000 => StreamEnd::Over,
+        1013 => StreamEnd::Restart,
+        _ => StreamEnd::Resume,
+    }
+}
+
+/// What a reconnect attempt for a stream concluded.
+enum NextConn {
+    /// Back on the air. `fresh` is true when this is a NEW stream
+    /// (start-over) rather than a resumed one.
+    Continue(Box<rex_conn::Ws>, rex_conn::DataWelcome, bool),
+    /// Nothing definitive (transport error, control connection also
+    /// down, a 0x02 that needs the retry): try again shortly.
+    RetryLater,
+    /// Unknown REJECT reason: treat as failure and stop.
+    Stop,
+}
+
+/// Feeds one block's data stream into a replica and publishes its
+/// frames, across any number of connections: on a close other than our
+/// own 1000 the task RESUMEs with the exact byte count (the server holds
+/// the stream ~60s), and per the REJECT reason table it starts over with
+/// a new ticket when the token or the stream is gone. The byte counter
+/// is [`rex_conn::StreamResume`], incremented exactly once per consumed
+/// binary payload right here — the one place frames are consumed.
 async fn stream_block(
     socket: &str,
     ticket: &[u8],
+    session_id: &str,
     block_id: &str,
+    tickets: mpsc::UnboundedSender<TicketRequest>,
     events: async_channel::Sender<ClientEvent>,
 ) -> Result<()> {
-    let (mut ws, nonce) = rex_conn::open_data(socket, ticket).await?;
-    let mut replica = Replica::new(nonce)?;
+    let mut resume = rex_conn::StreamResume::default();
+    let (mut ws, welcome) = rex_conn::open_data(socket, ticket).await?;
+    resume.welcomed(welcome);
+    let mut replica = Replica::new(welcome.nonce)?;
     let mut first_frame = true;
-    while let Some(message) = ws.next().await {
-        let bytes = match message? {
-            Message::Binary(bytes) => bytes,
-            // The server only sends binary on a data stream.
-            _ => continue,
+    'stream: loop {
+        // ---- consume this connection until it ends ----
+        let end = loop {
+            match ws.next().await {
+                Some(Ok(Message::Binary(bytes))) => {
+                    // Count exactly what this payload was, before the
+                    // replica uses it: every stream byte consumed, across
+                    // every connection of the stream, never the WELCOME.
+                    resume.consume(bytes.len());
+                    let fed = replica.feed(&bytes)?;
+                    if let Some((cols, rows, cell_w, cell_h)) = fed.resize {
+                        // Cross-check, not an assert: the server tells us
+                        // the cell size it sized the grid for (0 when
+                        // unknown). When it's nonzero it should match what
+                        // we asked for — a mismatch means our own request
+                        // didn't land, or someone else owns the block.
+                        if cell_w > 0 && cell_h > 0 {
+                            let (want_w, want_h) = (
+                                crate::terminal::CELL_W_PX as u32,
+                                crate::terminal::CELL_H_PX as u32,
+                            );
+                            if cell_w == want_w && cell_h == want_h {
+                                debug!("block {block_id}: resize {cols}x{rows} at {cell_w}x{cell_h}px matches our cell metrics");
+                            } else {
+                                debug!(
+                                    "block {block_id}: resize {cols}x{rows} at {cell_w}x{cell_h}px differs from our {want_w}x{want_h}px (someone else owns the grid?)"
+                                );
+                            }
+                        } else {
+                            debug!("block {block_id}: resize {cols}x{rows}, cell px unknown");
+                        }
+                    }
+                    if fed.changed {
+                        if let Some(frame) = replica.frame()? {
+                            if first_frame {
+                                first_frame = false;
+                                debug!(
+                                    "block {block_id}: first frame {}x{}",
+                                    frame.cols, frame.rows,
+                                );
+                            }
+                            let _ = events
+                                .send(ClientEvent::Frame(block_id.to_owned(), Arc::new(frame)))
+                                .await;
+                        }
+                    }
+                    if let Some(code) = fed.exited {
+                        let _ = events
+                            .send(ClientEvent::Notice(format!("program exited with {code}")))
+                            .await;
+                    }
+                }
+                Some(Ok(Message::Close(Some(frame)))) => {
+                    let code: u16 = frame.code.into();
+                    debug!("block {block_id}: data connection closed {code}");
+                    break classify_close(code);
+                }
+                // Pings and text never appear on a data stream; a close
+                // without a frame falls through to EOF on the next poll.
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    debug!("block {block_id}: data connection error: {error}");
+                    break StreamEnd::Resume;
+                }
+                None => break StreamEnd::Resume,
+            }
         };
-        let fed = replica.feed(&bytes)?;
-        if let Some((cols, rows, cell_w, cell_h)) = fed.resize {
-            // Cross-check, not an assert: the server tells us the cell size
-            // it sized the grid for (0 when unknown). When it's nonzero it
-            // should match what we asked for — a mismatch means our own
-            // request didn't land, or someone else owns the block.
-            if cell_w > 0 && cell_h > 0 {
-                let (want_w, want_h) = (
-                    crate::terminal::CELL_W_PX as u32,
-                    crate::terminal::CELL_H_PX as u32,
-                );
-                if cell_w == want_w && cell_h == want_h {
-                    debug!("block {block_id}: resize {cols}x{rows} at {cell_w}x{cell_h}px matches our cell metrics");
-                } else {
-                    debug!(
-                        "block {block_id}: resize {cols}x{rows} at {cell_w}x{cell_h}px differs from our {want_w}x{want_h}px (someone else owns the grid?)"
-                    );
-                }
-            } else {
-                debug!("block {block_id}: resize {cols}x{rows}, cell px unknown");
-            }
+        match end {
+            StreamEnd::Over => return Ok(()),
+            StreamEnd::Resume | StreamEnd::Restart => {}
         }
-        if fed.changed {
-            if let Some(frame) = replica.frame()? {
-                if first_frame {
-                    first_frame = false;
-                    debug!(
-                        "block {block_id}: first frame {}x{}",
-                        frame.cols, frame.rows,
-                    );
+        // ---- reconnect this stream ----
+        // The server holds a dropped stream ~60s; the control connection
+        // may also be reconnecting, so keep trying for a while before
+        // giving up on the block.
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            match next_connection(
+                socket,
+                &resume,
+                session_id,
+                block_id,
+                end == StreamEnd::Restart,
+                &tickets,
+            )
+            .await
+            {
+                NextConn::Continue(next, welcome, fresh) => {
+                    ws = *next;
+                    if fresh {
+                        // A new stream is a new channel: fresh Replica,
+                        // fresh snapshot, and the byte count starts over.
+                        resume.restarted(welcome);
+                        replica = Replica::new(welcome.nonce)?;
+                        first_frame = true;
+                        debug!("block {block_id}: started a new stream after {:?}", end);
+                    } else {
+                        resume.welcomed(welcome);
+                        debug!("block {block_id}: resumed at byte {}", resume.bytes());
+                    }
+                    continue 'stream;
                 }
-                let _ = events
-                    .send(ClientEvent::Frame(block_id.to_owned(), Arc::new(frame)))
-                    .await;
+                NextConn::RetryLater => {
+                    if std::time::Instant::now() > deadline {
+                        let _ = events
+                            .send(ClientEvent::Notice(format!(
+                                "block {block_id} could not reconnect; giving up"
+                            )))
+                            .await;
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                NextConn::Stop => return Ok(()),
             }
-        }
-        if let Some(code) = fed.exited {
-            let _ = events
-                .send(ClientEvent::Notice(format!("program exited with {code}")))
-                .await;
         }
     }
-    Ok(())
+}
+
+/// One reconnect attempt for a stream: RESUME with the exact count and
+/// the latest token, or — after a refused RESUME (0x01/0x03/0x05) or a
+/// 1013 `data reconnect required` — a start-over with a new ticket from
+/// the actor and a HELLO. 0x02 ("this client already has a connection…
+/// send a RESUME, which replaces it") is just retried. Unknown REJECT
+/// reasons are failures, per the doc.
+async fn next_connection(
+    socket: &str,
+    resume: &rex_conn::StreamResume,
+    session_id: &str,
+    block_id: &str,
+    restart: bool,
+    tickets: &mpsc::UnboundedSender<TicketRequest>,
+) -> NextConn {
+    if !restart {
+        if let Some(token) = resume.token() {
+            match rex_conn::resume_data(socket, token, resume.bytes()).await {
+                Ok(rex_conn::DataHandshake::Welcome(ws, welcome)) => {
+                    return NextConn::Continue(Box::new(*ws), welcome, false);
+                }
+                Ok(rex_conn::DataHandshake::Rejected(0x02)) => {
+                    // The old connection is still registered: a RESUME
+                    // replaces it — try again.
+                    return NextConn::RetryLater;
+                }
+                Ok(rex_conn::DataHandshake::Rejected(0x01 | 0x03 | 0x05)) => {
+                    // Token unknown/expired, stream gone, or the count
+                    // (never wrong, by construction) — the doc says start
+                    // over after a refused RESUME. Fall through.
+                    debug!("block {block_id}: RESUME refused; starting over");
+                }
+                Ok(rex_conn::DataHandshake::Rejected(reason)) => {
+                    debug!(
+                        "block {block_id}: RESUME rejected with unknown reason 0x{reason:02x}; stopping"
+                    );
+                    return NextConn::Stop;
+                }
+                Err(error) => {
+                    debug!("block {block_id}: RESUME attempt failed: {error}");
+                    return NextConn::RetryLater;
+                }
+            }
+        }
+    }
+    // Start over: a fresh ticket + HELLO. A refused HELLO uses up its
+    // ticket, so every attempt needs a new one from the actor.
+    match fresh_ticket(tickets, session_id, block_id).await {
+        Ok(ticket) => match rex_conn::open_data(socket, &ticket).await {
+            Ok((ws, welcome)) => NextConn::Continue(Box::new(ws), welcome, true),
+            Err(error) => {
+                debug!("block {block_id}: start-over HELLO failed: {error}");
+                NextConn::RetryLater
+            }
+        },
+        Err(error) => {
+            // The control connection may itself be down or reconnecting;
+            // the actor answers once it's back.
+            debug!("block {block_id}: no fresh ticket yet: {error}");
+            NextConn::RetryLater
+        }
+    }
+}
+
+/// Asks the actor for a fresh `data.connect` ticket and waits, bounded:
+/// the control connection may be reconnecting, but not forever.
+async fn fresh_ticket(
+    tickets: &mpsc::UnboundedSender<TicketRequest>,
+    session_id: &str,
+    block_id: &str,
+) -> Result<Vec<u8>> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    tickets
+        .send((session_id.to_owned(), block_id.to_owned(), reply_tx))
+        .map_err(|_| anyhow!("the actor is gone"))?;
+    match tokio::time::timeout(Duration::from_secs(30), reply_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => bail!("the actor dropped the ticket request"),
+        Err(_) => bail!("ticket request timed out"),
+    }
 }
 #[cfg(test)]
 mod tests {
-    use super::{default_local_keys, key_is_ours, normalize_key, revision_is_newer, Actor};
+    use super::*;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
 
@@ -1371,6 +1751,19 @@ mod tests {
         // Not one plain key: no key token, or two of them.
         assert_eq!(normalize_key("ctrl+"), None);
         assert_eq!(normalize_key("a+b"), None);
+    }
+
+    #[test]
+    fn close_status_table_matches_the_doc() {
+        // "When a Data Connection Closes": 1000 and 4000 end the task;
+        // 1013 starts a new stream; everything else (including unclean
+        // drops, which never carry a code) waits for a resume.
+        assert_eq!(classify_close(1000), StreamEnd::Over);
+        assert_eq!(classify_close(4000), StreamEnd::Over);
+        assert_eq!(classify_close(1013), StreamEnd::Restart);
+        for code in [1001u16, 1008, 1011, 1006, 0] {
+            assert_eq!(classify_close(code), StreamEnd::Resume, "code {code}");
+        }
     }
 
     #[test]
