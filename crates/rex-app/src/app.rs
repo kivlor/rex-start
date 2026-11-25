@@ -2,7 +2,7 @@
 //! way the server says, and a session picker. The client never invents
 //! split geometry — every rectangle comes from the server's layout tree.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{
@@ -12,7 +12,7 @@ use gpui::{
 use rex_terminal::{row_text, Frame};
 
 use crate::{
-    client::{Client, ClientCmd, ClientEvent, Direction, KeyEvent},
+    client::{default_local_keys, Client, ClientCmd, ClientEvent, Direction, KeyEvent},
     terminal::TerminalElement,
     view::{SessionBrief, SessionView},
 };
@@ -44,6 +44,13 @@ pub struct RexApp {
     debug_frames: Vec<String>,
     picker: Option<usize>,
     status: String,
+    /// The declared default keys still bound to the app's own actions in
+    /// the server's resolved keymap (spelling `binding_key` produces). A
+    /// key not in this set is rebound or removed, so it flows to
+    /// `client.key` instead of being handled here. Starts as the full
+    /// default set so keys work before the keymap arrives, and a failed
+    /// keymap call keeps that fallback.
+    ours: HashSet<String>,
 }
 
 impl RexApp {
@@ -62,6 +69,7 @@ impl RexApp {
             debug_frames: Vec::new(),
             picker: None,
             status: "connecting".into(),
+            ours: default_local_keys(),
         };
         // Pump client events into entity updates until the client ends.
         cx.spawn(async move |this, cx| {
@@ -127,6 +135,9 @@ impl RexApp {
                     eprintln!("[rex-app] {block_id} renders: {}", rows.join(" / "));
                 }
                 self.frames.insert(block_id, frame);
+            }
+            ClientEvent::Keymap(ours) => {
+                self.ours = ours;
             }
             ClientEvent::Notice(text) => {
                 self.status = text;
@@ -214,12 +225,18 @@ impl RexApp {
         }
     }
 
-    /// Keys for the session view: the app's own ctrl-alt-* bindings
-    /// take precedence locally, ctrl+v pastes the clipboard, and every
-    /// other typed key goes to the server through `client.key`, so the
-    /// server's Lua bindings (init.lua) get first chance at it.
+    /// Keys for the session view: the app's own ctrl-alt-* bindings take
+    /// precedence locally — but only the ones the server's resolved keymap
+    /// still binds to our actions (a Lua rebind moves them out from under
+    /// us, and those keys then flow to `client.key`, where init.lua's
+    /// `client.key.forward` gets first chance) — ctrl+v pastes the
+    /// clipboard, and every other typed key goes to the server through
+    /// `client.key`, so the server's Lua bindings get first chance at it.
     fn main_key(&mut self, keystroke: &gpui::Keystroke, cx: &mut Context<Self>) -> bool {
-        if keystroke.modifiers.control && keystroke.modifiers.alt {
+        if keystroke.modifiers.control
+            && keystroke.modifiers.alt
+            && self.ours.contains(&binding_key(keystroke))
+        {
             match keystroke.key.as_str() {
                 "right" => {
                     self.send(ClientCmd::NewSplit {
@@ -258,8 +275,14 @@ impl RexApp {
             }
         }
         // Paste: gpui 0.2 exposes no paste event, so ctrl+v reads the
-        // clipboard and sends it as chunked client.key text.
-        if keystroke.modifiers.control && !keystroke.modifiers.alt && keystroke.key == "v" {
+        // clipboard and sends it as chunked client.key text. Shift must
+        // not be held: ctrl+shift+v is its own key, and it flows to the
+        // server like any other chord.
+        if keystroke.modifiers.control
+            && !keystroke.modifiers.alt
+            && !keystroke.modifiers.shift
+            && keystroke.key == "v"
+        {
             let text = cx
                 .read_from_clipboard()
                 .and_then(|item| item.text())
@@ -484,6 +507,20 @@ impl RexApp {
 ///
 /// Returns None for keys with no useful terminal meaning: bare modifier
 /// presses, and anything gpui names that the mapping below doesn't know.
+///
+/// AltGr: on standard Linux layouts AltGr is ISO_Level3_Shift (Mod5),
+/// which gpui does not report as alt — those keystrokes are not chorded
+/// and deliver their layout character through the plain-text path. But
+/// layouts that map level 3 to Mod1 (XKB options like `lv3:lalt_switch`)
+/// arrive chorded with the composed character in `key_char`. There we
+/// send the text with `consumed_mods: "alt"` — the schema's field for
+/// modifiers the layout used to produce text — which a live probe
+/// confirmed types the character instead of the alt chord's ESC prefix.
+/// A composed character is one that differs from the keystroke's key
+/// name (gpui falls back to the base key's letter, e.g. key "q" with
+/// key_char "€") or is itself not an ASCII alphanumeric (German
+/// AltGr+q composes "@", and the keysym IS that character); a plain
+/// alt chord keeps the key name and its letter/digit character.
 fn keystroke_to_key_event(keystroke: &gpui::Keystroke) -> Option<KeyEvent> {
     use gpui::Modifiers;
 
@@ -509,8 +546,18 @@ fn keystroke_to_key_event(keystroke: &gpui::Keystroke) -> Option<KeyEvent> {
         mods.push("super");
     }
     // A key held by a control-ish modifier types nothing: the terminal
-    // gets the control code via the physical key and mods instead.
+    // gets the control code via the physical key and mods instead —
+    // unless the layout composed a character with alt (AltGr).
     let chorded = control || alt || super_;
+    let altgr_composed = alt
+        && !control
+        && !super_
+        && keystroke.key.len() == 1
+        && keystroke.key_char.as_deref().is_some_and(|c| {
+            let plain_chord = c.eq_ignore_ascii_case(&keystroke.key)
+                && c.chars().all(|ch| ch.is_ascii_alphanumeric());
+            !plain_chord
+        });
 
     // gpui names special keys the way its keybindings spell them.
     let (key, codepoint) = match keystroke.key.as_str() {
@@ -557,30 +604,63 @@ fn keystroke_to_key_event(keystroke: &gpui::Keystroke) -> Option<KeyEvent> {
         _ => return None,
     };
 
-    let text = if chorded {
+    let (text, consumed_mods) = if altgr_composed {
+        // The layout consumed alt to compose the character; keep mods so
+        // server-side bindings can still see the chord.
+        (
+            keystroke.key_char.clone().unwrap_or_default(),
+            "alt".to_owned(),
+        )
+    } else if chorded {
         // A control-ish chord types nothing: the terminal gets the
         // control code via the physical key and mods instead.
-        String::new()
+        (String::new(), String::new())
     } else if keystroke.key == "space" {
-        " ".to_owned()
+        (" ".to_owned(), String::new())
     } else if keystroke.key.len() == 1 {
         // key_char is what the layout produces for this press, e.g. "S"
         // for shift+s, "ß" for alt+s on some layouts.
-        keystroke
-            .key_char
-            .clone()
-            .unwrap_or_else(|| keystroke.key.clone())
+        (
+            keystroke
+                .key_char
+                .clone()
+                .unwrap_or_else(|| keystroke.key.clone()),
+            String::new(),
+        )
     } else {
         // Named keys (arrows, enter, escape, ...) type nothing.
-        String::new()
+        (String::new(), String::new())
     };
 
     Some(KeyEvent {
         key,
         mods: mods.join("+"),
         text,
+        consumed_mods,
         unshifted_codepoint: codepoint,
     })
+}
+
+/// A keystroke in the spelling keymap bindings use: mods in the
+/// protocol's order (shift, ctrl, alt, super), then the lowercase key,
+/// e.g. "ctrl+alt+z". This is what `ClientEvent::Keymap` carries and
+/// `main_key` matches on.
+fn binding_key(keystroke: &gpui::Keystroke) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if keystroke.modifiers.shift {
+        parts.push("shift".into());
+    }
+    if keystroke.modifiers.control {
+        parts.push("ctrl".into());
+    }
+    if keystroke.modifiers.alt {
+        parts.push("alt".into());
+    }
+    if keystroke.modifiers.platform {
+        parts.push("super".into());
+    }
+    parts.push(keystroke.key.to_lowercase());
+    parts.join("+")
 }
 
 #[cfg(test)]
@@ -667,5 +747,110 @@ mod tests {
             .expect("mappable");
         assert_eq!(event.key, "minus");
         assert_eq!(event.text, "-");
+    }
+
+    #[test]
+    fn alt_composed_symbol_keeps_text_with_consumed_alt() {
+        // Exotic layout where level 3 sits on Mod1 (gpui reports alt):
+        // German AltGr+q composes "@" — the keysym IS the character, so
+        // gpui's key and key_char agree and it is not an ASCII letter.
+        let event = keystroke_to_key_event(&keystroke(
+            "@",
+            Some("@"),
+            gpui::Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+        ))
+        .expect("mappable");
+        assert_eq!(event.mods, "alt");
+        assert_eq!(event.consumed_mods, "alt");
+        assert_eq!(event.text, "@");
+    }
+
+    #[test]
+    fn alt_composed_non_ascii_char_types_the_char() {
+        // AltGr+q composing "€": gpui falls back to the base key's letter
+        // for non-ASCII key_char, so key_char differs from the key name.
+        let event = keystroke_to_key_event(&keystroke(
+            "q",
+            Some("\u{20ac}"),
+            gpui::Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+        ))
+        .expect("mappable");
+        assert_eq!(event.mods, "alt");
+        assert_eq!(event.consumed_mods, "alt");
+        assert_eq!(event.text, "\u{20ac}");
+    }
+
+    #[test]
+    fn plain_alt_chord_still_types_nothing() {
+        // US plain alt+q: the key name and key_char agree and are
+        // alphanumeric — a chord, not a composition.
+        let event = keystroke_to_key_event(&keystroke(
+            "q",
+            Some("q"),
+            gpui::Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+        ))
+        .expect("mappable");
+        assert_eq!(event.mods, "alt");
+        assert_eq!(event.consumed_mods, "");
+        assert_eq!(event.text, "");
+        // Alt+shift+s is equally a plain chord (key name lowercased).
+        let event = keystroke_to_key_event(&keystroke(
+            "s",
+            Some("S"),
+            gpui::Modifiers {
+                alt: true,
+                shift: true,
+                ..Default::default()
+            },
+        ))
+        .expect("mappable");
+        assert_eq!(event.mods, "shift+alt");
+        assert_eq!(event.text, "");
+    }
+
+    #[test]
+    fn binding_key_matches_keymap_spelling() {
+        let key = binding_key(&keystroke(
+            "z",
+            None,
+            gpui::Modifiers {
+                control: true,
+                alt: true,
+                ..Default::default()
+            },
+        ));
+        assert_eq!(key, "ctrl+alt+z");
+        assert_eq!(
+            binding_key(&keystroke(
+                "right",
+                None,
+                gpui::Modifiers {
+                    control: true,
+                    alt: true,
+                    ..Default::default()
+                }
+            )),
+            "ctrl+alt+right"
+        );
+        assert_eq!(
+            binding_key(&keystroke(
+                "v",
+                None,
+                gpui::Modifiers {
+                    control: true,
+                    ..Default::default()
+                }
+            )),
+            "ctrl+v"
+        );
     }
 }

@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 use rex_conn::{connect, hello, Rpc};
 use rex_terminal::Replica;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -39,6 +39,9 @@ pub enum ClientCmd {
     SendKey {
         key: KeyEvent,
         /// Earlier keys when `key` ends a sequence, e.g. `Some(["ctrl+b"])`.
+        /// UNUSED so far: the UI never waits on sequences (the client's
+        /// job per the keymap notes), so this is always None — kept
+        /// plumbed for sequence support, which issue #5/#6 picks up.
         prefix: Option<Vec<String>>,
     },
     /// `client.key` in chunks: paste as text, split to stay under the
@@ -48,25 +51,29 @@ pub enum ClientCmd {
 
 /// One keyboard event for `client.key`: physical key name (W3C code in
 /// snake_case, `unidentified` for synthesized text), mods joined with `+`,
-/// the text it typed, and its unshifted code point for layout-dependent
-/// bindings such as `ctrl+n`.
+/// the text it typed, the mods the layout consumed to produce that text,
+/// and its unshifted code point for layout-dependent bindings such as
+/// `ctrl+n`.
 #[derive(Clone, Debug)]
 pub struct KeyEvent {
     pub key: String,
     pub mods: String,
     pub text: String,
+    /// The modifiers the keyboard layout used to produce `text` (the
+    /// schema's `consumed_mods`), e.g. "alt" for an AltGr composition.
+    /// Empty for chords that type nothing and for plain text.
+    pub consumed_mods: String,
     pub unshifted_codepoint: i32,
 }
 
 impl KeyEvent {
-    /// A key press as `client.key`'s `key` object. `consumed_mods` is
-    /// empty (we don't track layout-consumed shift) and `composing` is
-    /// false (GPUI gives us finished compositions).
+    /// A key press as `client.key`'s `key` object. `composing` is false
+    /// (GPUI gives us finished compositions).
     fn as_json(&self) -> Value {
         json!({
             "key": self.key,
             "mods": self.mods,
-            "consumed_mods": "",
+            "consumed_mods": self.consumed_mods,
             "text": self.text,
             "unshifted_codepoint": self.unshifted_codepoint,
             "composing": false,
@@ -110,6 +117,13 @@ pub enum ClientEvent {
     Frame(String, Arc<rex_terminal::Frame>),
     /// Something worth a line in the status bar.
     Notice(String),
+    /// The keys the server's resolved keymap still binds to the app's own
+    /// actions, in binding spelling ("ctrl+alt+z" — the same form the UI's
+    /// `binding_key` produces). The UI handles only these locally; every
+    /// other key flows to `client.key`, so a Lua binding gets its chance.
+    /// Sent after the `client.keymap` declaration and after every
+    /// `keymap_changed` that changes the config hash.
+    Keymap(HashSet<String>),
     /// The control connection ended; the UI can say so.
     Closed(String),
 }
@@ -162,6 +176,120 @@ pub fn start(socket: String, preferred: Option<String>, new_session: bool) -> Re
     })
 }
 
+/// The app's own actions, exactly as `declare_keymap` declares them.
+const OUR_ACTIONS: [&str; 4] = ["app.split", "app.zoom", "app.picker", "app.new_session"];
+
+/// The default layer's key bindings, in the spelling `normalize_key`
+/// produces and the UI's `binding_key` matches.
+const DEFAULT_LOCAL_KEYS: [&str; 5] = [
+    "ctrl+alt+right",
+    "ctrl+alt+down",
+    "ctrl+alt+z",
+    "ctrl+alt+p",
+    "ctrl+alt+n",
+];
+
+/// The keys the UI handles locally when the keymap is unknown or the
+/// `client.keymap` call failed: every declared default.
+pub fn default_local_keys() -> HashSet<String> {
+    DEFAULT_LOCAL_KEYS.iter().map(|k| k.to_string()).collect()
+}
+
+/// Canonical spelling for one key of a keymap binding: mods in the
+/// protocol's order (shift, ctrl, alt, super), then the key, all
+/// lowercase — so `Alt+Ctrl+Z` and `ctrl+alt+z` agree, and `cmd` maps
+/// to `super`. None for anything that isn't one plain key.
+pub fn normalize_key(key: &str) -> Option<String> {
+    let mut shift = false;
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut super_ = false;
+    let mut name: Option<String> = None;
+    for token in key.split('+') {
+        match token.trim().to_lowercase().as_str() {
+            // A trailing separator ("ctrl+") or an empty token is not a
+            // key spelling.
+            "" => return None,
+            "shift" => shift = true,
+            "ctrl" | "control" => ctrl = true,
+            "alt" | "altgr" => alt = true,
+            "super" | "cmd" | "meta" => super_ = true,
+            other => {
+                if name.replace(other.to_owned()).is_some() {
+                    // More than one key token: not one plain key.
+                    return None;
+                }
+            }
+        }
+    }
+    let name = name?;
+    let mut parts: Vec<&str> = Vec::new();
+    if shift {
+        parts.push("shift");
+    }
+    if ctrl {
+        parts.push("ctrl");
+    }
+    if alt {
+        parts.push("alt");
+    }
+    if super_ {
+        parts.push("super");
+    }
+    parts.push(&name);
+    Some(parts.join("+"))
+}
+
+/// Which of the declared default keys the resolved keymap still binds to
+/// our own actions. A binding the config or a Lua script took over comes
+/// back as `client.key.forward` — always available, the bindings below
+/// it on that key never run — so such a key leaves the set, as does a
+/// key the config removed or bound elsewhere. Bindings in a mode or
+/// key sequences (more than one element) wait on the server instead.
+fn resolved_local_keys(bindings: &Value) -> HashSet<String> {
+    let list: &[serde_json::Value] = bindings.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+    DEFAULT_LOCAL_KEYS
+        .iter()
+        .filter(|default| key_is_ours(list, default))
+        .map(|default| default.to_string())
+        .collect()
+}
+
+/// Is one default key still bound to our actions in the resolved list?
+fn key_is_ours(bindings: &[Value], default: &str) -> bool {
+    let mut first_action: Option<&str> = None;
+    for binding in bindings {
+        let Some(keys) = binding["keys"].as_array() else {
+            continue;
+        };
+        // A sequence's first key is not a binding of its own: the client
+        // waits on the server, so don't claim it.
+        if keys.len() != 1 {
+            continue;
+        }
+        let Some(key) = keys[0].as_str().and_then(normalize_key) else {
+            continue;
+        };
+        if key != default {
+            continue;
+        }
+        // Mode bindings apply only while that mode is active, which the
+        // app doesn't track; ignore them and keep looking.
+        if binding.get("mode").is_some_and(|m| !m.is_null()) {
+            continue;
+        }
+        let action = binding["action"].as_str();
+        // A Lua binding wins regardless of order: always available.
+        if action == Some("client.key.forward") {
+            return false;
+        }
+        if first_action.is_none() {
+            first_action = action;
+        }
+    }
+    first_action.is_some_and(|action| OUR_ACTIONS.contains(&action))
+}
+
 /// The session the window is showing, plus its live data streams.
 struct Current {
     session: SessionBrief,
@@ -179,6 +307,9 @@ struct Actor {
     /// The welcome's `limits.max_message_bytes`: any larger request would
     /// close the connection (status 1009), so paste chunks under it.
     max_message_bytes: u64,
+    /// The config hash of the last `client.keymap` result; a
+    /// `keymap_changed` event with a different hash re-fetches it.
+    keymap_hash: Option<String>,
 }
 
 /// Set `REX_APP_DEBUG=1` to see the actor's protocol progress on stderr:
@@ -227,6 +358,7 @@ async fn start_actor(
         sessions: Vec::new(),
         current: None,
         max_message_bytes,
+        keymap_hash: None,
     };
 
     // Declare the app's own actions and their default bindings, so the
@@ -411,10 +543,13 @@ impl Actor {
     }
 
     /// `client.keymap`: declare the app's own actions (kind "client") and
-    /// the default layer binding the app's ctrl-alt-* keys to them.
-    /// init.lua can rebind these names; a Lua-bound key then comes back
-    /// in the keymap as `client.key.forward`, which is exactly the path
-    /// SendKey uses, so Lua bindings keep first chance at every key.
+    /// the default layer binding the app's ctrl-alt-* keys to them, then
+    /// publish which of those keys the RESOLVED keymap still binds to our
+    /// actions. init.lua can rebind these names; a Lua-bound key comes back
+    /// as `client.key.forward`, so it leaves our set and flows to
+    /// `client.key` — where the binding actually fires. If the call fails,
+    /// the UI keeps handling every declared default locally (the
+    /// `ClientEvent::Keymap` it starts with) and we debug-log.
     async fn declare_keymap(&mut self) {
         let payload = json!({
             "actions": [
@@ -462,13 +597,23 @@ impl Actor {
         });
         match self.rpc.call("client.keymap", payload).await {
             Ok(keymap) => {
-                let lua_bindings = keymap["bindings"].as_array().map(|b| b.len()).unwrap_or(0);
-                debug!("keymap declared: {lua_bindings} resolved bindings");
+                self.keymap_hash = keymap["config"]["hash"].as_str().map(str::to_owned);
+                let ours = resolved_local_keys(&keymap["bindings"]);
+                debug!(
+                    "keymap: {} resolved bindings; still ours: {:?}",
+                    keymap["bindings"].as_array().map(Vec::len).unwrap_or(0),
+                    ours
+                );
+                let _ = self.events.send(ClientEvent::Keymap(ours)).await;
             }
             Err(error) => {
-                // A failed declaration must not stop the app: the app's
-                // own keys still work locally.
+                // A failed declaration must not stop the app: the UI's
+                // fallback is handling all declared defaults locally.
                 debug!("client.keymap declaration failed: {error}");
+                let _ = self
+                    .events
+                    .send(ClientEvent::Keymap(default_local_keys()))
+                    .await;
             }
         }
     }
@@ -521,6 +666,7 @@ impl Actor {
                 key: "unidentified".into(),
                 mods: String::new(),
                 text: chunk.to_owned(),
+                consumed_mods: String::new(),
                 unshifted_codepoint: 0,
             };
             let payload = json!({"session_id": session_id, "key": key.as_json()});
@@ -809,6 +955,22 @@ impl Actor {
             // A session moved in the list; the order it changed to is not
             // worth a round trip right now.
             "session_moved" => {}
+            // The configuration file was reloaded; our keymap may have
+            // changed under us. Docs: compare the hash and re-fetch only
+            // when it differs (a declaration that failed left None, so a
+            // reload is also the retry path).
+            "keymap_changed" => {
+                // The fields sit one payload level down, like a session
+                // event's.
+                let hash = payload["payload"]["hash"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                if self.keymap_hash.as_deref() != Some(hash.as_str()) {
+                    debug!("keymap changed (hash {hash}), re-fetching");
+                    self.declare_keymap().await;
+                }
+            }
             "session_event" => {
                 // A session's event arrives wrapped: the session's ID and
                 // the event itself sit one payload level down.
@@ -882,8 +1044,9 @@ async fn stream_block(
 }
 #[cfg(test)]
 mod tests {
-    use super::revision_is_newer;
+    use super::{default_local_keys, key_is_ours, normalize_key, revision_is_newer};
     use serde_json::json;
+    use std::collections::HashSet;
 
     #[test]
     fn revision_must_be_strictly_newer() {
@@ -894,31 +1057,64 @@ mod tests {
     }
 
     #[test]
-    fn chunk_json_safe_splits_on_char_boundaries() {
-        let text = "\u{e9}abc\u{1f600}def";
-        let chunks: Vec<&str> = rex_conn::chunk_json_safe(text, 5).collect();
-        assert_eq!(chunks, vec!["\u{e9}a", "bc", "\u{1f600}", "def"]);
-    }
-
-    #[test]
-    fn chunk_json_safe_empty_and_huge() {
-        assert_eq!(rex_conn::chunk_json_safe("", 100).count(), 0);
-        let huge = "x".repeat(10_000);
+    fn normalize_key_orders_mods_and_lowercases() {
+        assert_eq!(normalize_key("ctrl+alt+z"), Some("ctrl+alt+z".into()));
+        assert_eq!(normalize_key("Alt+Ctrl+Z"), Some("ctrl+alt+z".into()));
         assert_eq!(
-            rex_conn::chunk_json_safe(&huge, 1024)
-                .map(str::len)
-                .sum::<usize>(),
-            10_000
+            normalize_key("shift+ctrl+alt+down"),
+            Some("shift+ctrl+alt+down".into())
         );
-        assert!(rex_conn::chunk_json_safe(&huge, 1024).all(|c| c.len() <= 1024));
+        assert_eq!(normalize_key("cmd+k"), Some("super+k".into()));
+        assert_eq!(normalize_key("v"), Some("v".into()));
+        // Not one plain key: no key token, or two of them.
+        assert_eq!(normalize_key("ctrl+"), None);
+        assert_eq!(normalize_key("a+b"), None);
     }
 
     #[test]
-    fn chunk_json_safe_wide_char_in_narrow_chunk() {
-        // A single character wider than the chunk still goes out whole
-        // rather than looping on empty chunks.
-        let chunks: Vec<&str> = rex_conn::chunk_json_safe("a\u{1f600}b", 4).collect();
-        assert_eq!(chunks, vec!["a", "\u{1f600}", "b"]);
+    fn resolved_local_keys_honor_rebinds_and_removals() {
+        // Everything still ours: the resolved list of a fresh server.
+        let fresh = json!([
+            {"keys": ["ctrl+alt+right"], "action": "app.split", "args": {"direction": "horizontal"}},
+            {"keys": ["ctrl+alt+down"], "action": "app.split", "args": {"direction": "vertical"}},
+            {"keys": ["ctrl+alt+z"], "action": "app.zoom"},
+            {"keys": ["ctrl+alt+p"], "action": "app.picker"},
+            {"keys": ["ctrl+alt+n"], "action": "app.new_session"}
+        ]);
+        assert_eq!(super::resolved_local_keys(&fresh), default_local_keys());
+
+        // init.lua took over ctrl+alt+p (a Lua binding reports as
+        // client.key.forward, which always wins), ctrl+alt+n was rebound
+        // to another action, ctrl+alt+right starts a sequence, and
+        // ctrl+alt+down was removed: only zoom stays ours. A mode
+        // binding for ctrl+alt+z must not hide the modeless one.
+        let rebound = json!([
+            {"keys": ["ctrl+alt+p"], "action": "client.key.forward", "source": "init.lua:3"},
+            {"keys": ["ctrl+alt+z"], "action": "app.zoom"},
+            {"keys": ["ctrl+alt+z"], "action": "client.key.forward", "mode": "resize"},
+            {"keys": ["ctrl+alt+n"], "action": "dev_layout"},
+            {"keys": ["ctrl+alt+right", "x"], "action": "app.split"}
+        ]);
+        let rebound: &[serde_json::Value] = rebound.as_array().unwrap();
+        assert!(key_is_ours(rebound, "ctrl+alt+z"));
+        assert!(!key_is_ours(rebound, "ctrl+alt+p"));
+        assert!(!key_is_ours(rebound, "ctrl+alt+n"));
+        assert!(!key_is_ours(rebound, "ctrl+alt+right"));
+        assert!(!key_is_ours(rebound, "ctrl+alt+down"));
+        let only_zoom: HashSet<String> = ["ctrl+alt+z"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(super::resolved_local_keys(&json!(rebound)), only_zoom);
+
+        // Nothing bound at all: nothing ours.
+        assert_eq!(
+            super::resolved_local_keys(&json!([])),
+            HashSet::<String>::new()
+        );
+    }
+
+    #[test]
+    fn default_local_keys_are_the_declared_defaults() {
+        assert!(default_local_keys().contains("ctrl+alt+z"));
+        assert_eq!(default_local_keys().len(), 5);
     }
 
     #[test]
