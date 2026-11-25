@@ -47,13 +47,11 @@ the server's ordered methods, one call at a time; layout geometry always
 comes from the server. Closing the window only disconnects — sessions
 and their programs keep running.
 
-Building `rex-app` needs GPUI's Linux system libraries. On Fedora the
-runtime packages are usually already installed (vulkan-loader,
-libwayland-*, libxkbcommon, fontconfig); the linker also needs the
-development symlinks (`dnf install libxcb-devel libxkbcommon-devel
-libxkbcommon-x11-devel`). Without root, symlinking the versioned
-`.so.N` files to unversioned `.so` names in a directory and passing it
-with `RUSTFLAGS="-L <dir>"` works too. One more caveat: `libc` ≥ 0.2.190
+Building `rex-app` needs GPUI's Linux system libraries. On Fedora install
+the development packages with
+`sudo dnf install libxcb-devel libxkbcommon-devel libxkbcommon-x11-devel`
+(the runtime loaders are usually already present). Build also requires
+Zig 0.17, pinned via `mise` (see `mise.toml`). One more caveat: `libc` ≥ 0.2.190
 removed `ENOATTR`, which breaks `xattr 0.2.3` (a GPUI dependency) —
 the lockfile pins `libc 0.2.189` / `mio 1.2.4` until gpui updates.
 
