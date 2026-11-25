@@ -12,6 +12,7 @@ anyhow = "1"
 async-channel = "2"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 gpui = { version = "=0.2.2", default-features = false, features = ["wayland", "x11"] }
+libc = "0.2"
 rex-conn = { path = "../rex-conn" }
 rex-terminal = { path = "../rex-terminal" }
 serde = { version = "1", features = ["derive"] }

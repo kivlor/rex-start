@@ -63,8 +63,8 @@ pub enum ClientEvent {
     },
     /// The session list changed.
     Sessions(Vec<SessionBrief>),
-    /// A new view of the current session (also the first view).
-    View(SessionView),
+    /// The session the window is showing, and its live data streams.
+    View(SessionBrief, SessionView),
     /// The session the window shows is gone from the server.
     CurrentGone,
     /// A block's latest rendered screen.
@@ -88,14 +88,27 @@ pub fn start(socket: String, preferred: Option<String>, new_session: bool) -> Re
     let (event_tx, event_rx) = async_channel::unbounded::<ClientEvent>();
     let builder = std::thread::Builder::new().name("rex-client".into());
     builder.spawn(move || {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        // Built inside the thread, but a failure is reported instead of
+        // panicking: without this, the window would hang on "connecting"
+        // forever with nothing to say why.
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
-            .expect("tokio runtime");
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let _ = event_tx.try_send(ClientEvent::Closed(format!(
+                    "client runtime failed: {error}"
+                )));
+                return;
+            }
+        };
         // Replicas hold libghostty iterators that are not Send, so stream
         // tasks run on a LocalSet on this thread instead of the pool.
         let local = tokio::task::LocalSet::new();
+        // The runtime is dropped here, after block_on returns — never from
+        // within the async context it drives.
         let _ = runtime.block_on(local.run_until(run(
             socket,
             preferred,
@@ -136,14 +149,15 @@ macro_rules! debug {
     };
 }
 
-async fn run(
-    socket: String,
-    preferred: Option<String>,
-    new_session: bool,
-    cmd_rx: async_channel::Receiver<ClientCmd>,
-    event_tx: async_channel::Sender<ClientEvent>,
-) -> Result<()> {
-    let ws = connect(&socket, "/api/control", "rex.control.v1").await?;
+/// Connects, handshakes, bootstraps, and attaches the preferred session:
+/// everything before the main loop. The caller turns any failure into
+/// `ClientEvent::Closed`, so the window never hangs on "connecting".
+async fn start_actor(
+    socket: &str,
+    preferred: Option<&str>,
+    events: async_channel::Sender<ClientEvent>,
+) -> Result<(Actor, mpsc::UnboundedReceiver<Value>)> {
+    let ws = connect(socket, "/api/control", "rex.control.v1").await?;
     let (ws, _welcome) = hello(
         ws,
         json!({"kind": "app", "name": "rex-app", "version": env!("CARGO_PKG_VERSION")}),
@@ -152,22 +166,21 @@ async fn run(
 
     // Events that arrive while a call is waiting land in this queue; the
     // main loop drains it alongside the socket.
-    let (queued_tx, mut queued_rx) = mpsc::unbounded_channel::<Value>();
+    let (queued_tx, queued_rx) = mpsc::unbounded_channel::<Value>();
     let rpc = Rpc::new(ws, move |event: &Value| {
         let _ = queued_tx.send(event.clone());
     });
 
     let mut actor = Actor {
-        socket: socket.clone(),
+        socket: socket.to_owned(),
         rpc,
-        events: event_tx.clone(),
+        events,
         sessions: Vec::new(),
         current: None,
     };
 
-    // ---- bootstrap: events, session list, and one session attached ----
     let mut payload = json!({"event_scope": "session"});
-    if let Some(id) = actor.resolve_preferred(preferred.as_deref()).await? {
+    if let Some(id) = actor.resolve_preferred(preferred).await? {
         payload["attach_session_ids"] = Value::from(vec![id]);
     }
     let bootstrap: Bootstrap =
@@ -179,7 +192,8 @@ async fn run(
     );
     actor.sessions = bootstrap.attach_all.sessions.clone();
     let first = bootstrap.attached_sessions.first().cloned();
-    let _ = event_tx
+    let _ = actor
+        .events
         .send(ClientEvent::Connected {
             sessions: actor.sessions.clone(),
             current: first.as_ref().map(attached_to_pair),
@@ -188,6 +202,28 @@ async fn run(
     if let Some(attached) = first {
         actor.set_current(attached).await;
     }
+    Ok((actor, queued_rx))
+}
+
+async fn run(
+    socket: String,
+    preferred: Option<String>,
+    new_session: bool,
+    cmd_rx: async_channel::Receiver<ClientCmd>,
+    event_tx: async_channel::Sender<ClientEvent>,
+) -> Result<()> {
+    // Every way the startup can fail funnels through here: the window
+    // gets a Closed reason instead of staying on "connecting".
+    let (mut actor, mut queued_rx) =
+        match start_actor(&socket, preferred.as_deref(), event_tx.clone()).await {
+            Ok(started) => started,
+            Err(error) => {
+                let reason = format!("connect failed: {error}");
+                debug!("{reason}");
+                let _ = event_tx.send(ClientEvent::Closed(reason)).await;
+                return Ok(());
+            }
+        };
     if new_session {
         if let Err(error) = actor.new_session("rex-app").await {
             debug!("new session failed: {error}");
@@ -226,6 +262,12 @@ async fn run(
     let _ = event_tx.send(ClientEvent::Closed(reason)).await;
     // Dropping the actor aborts its stream tasks and closes every socket.
     Ok(())
+}
+
+/// Revision gating: a view is worth adopting only when the server's
+/// revision is strictly newer than the one we are already showing.
+fn revision_is_newer(new: u64, known: Option<u64>) -> bool {
+    known.is_none_or(|known| new > known)
 }
 
 fn attached_to_pair(attached: &Attached) -> (SessionBrief, SessionView) {
@@ -288,6 +330,16 @@ impl Actor {
 
     async fn notice(&self, text: String) {
         let _ = self.events.send(ClientEvent::Notice(text)).await;
+    }
+
+    /// Stops watching the current session, aborting its stream tasks so
+    /// their stale frames stop arriving.
+    fn drop_current(&mut self) {
+        if let Some(current) = self.current.take() {
+            for task in current.streams.values() {
+                task.abort();
+            }
+        }
     }
 
     async fn emit_sessions(&self) {
@@ -404,6 +456,10 @@ impl Actor {
         let previous = self.current.take();
         if let Some(previous) = &previous {
             // The old session keeps running; we just stop watching it.
+            // Abort its stream tasks so no stale frames keep arriving.
+            for task in previous.streams.values() {
+                task.abort();
+            }
             let _ = self
                 .rpc
                 .call(
@@ -429,7 +485,9 @@ impl Actor {
             session.session_id, view.revision,
         );
         let events = self.events.clone();
-        let _ = events.send(ClientEvent::View(view.clone())).await;
+        let _ = events
+            .send(ClientEvent::View(session.clone(), view.clone()))
+            .await;
         self.current = Some(Current {
             session,
             view,
@@ -453,7 +511,7 @@ impl Actor {
         let Some(current) = &mut self.current else {
             return Ok(());
         };
-        if view.revision <= current.view.revision {
+        if !revision_is_newer(view.revision, Some(current.view.revision)) {
             debug!(
                 "view revision {} not newer than {}",
                 view.revision, current.view.revision
@@ -461,7 +519,10 @@ impl Actor {
             return Ok(());
         }
         debug!("refreshed view to revision {}", view.revision);
-        let _ = self.events.send(ClientEvent::View(view.clone())).await;
+        let _ = self
+            .events
+            .send(ClientEvent::View(current.session.clone(), view.clone()))
+            .await;
         current.view = view;
         self.sync_streams().await;
         Ok(())
@@ -553,7 +614,7 @@ impl Actor {
                     .as_ref()
                     .is_some_and(|current| current.session.session_id == gone)
                 {
-                    self.current = None;
+                    self.drop_current();
                     let _ = self.events.send(ClientEvent::CurrentGone).await;
                 }
                 self.emit_sessions().await;
@@ -577,7 +638,7 @@ impl Actor {
                 if event["type"] == "session_view_changed" {
                     let revision = event["payload"]["revision"].as_u64().unwrap_or(0);
                     let known = self.current.as_ref().map(|c| c.view.revision);
-                    if known.is_none_or(|known| revision > known) {
+                    if revision_is_newer(revision, known) {
                         debug!("view changed to revision {revision}, refreshing");
                         if let Err(error) = self.refresh_view().await {
                             debug!("view refresh failed: {error}");
@@ -631,4 +692,17 @@ async fn stream_block(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::revision_is_newer;
+
+    #[test]
+    fn revision_must_be_strictly_newer() {
+        assert!(revision_is_newer(2, None));
+        assert!(revision_is_newer(3, Some(2)));
+        assert!(!revision_is_newer(2, Some(2)));
+        assert!(!revision_is_newer(1, Some(2)));
+    }
 }

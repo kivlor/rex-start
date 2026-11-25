@@ -4552,6 +4552,7 @@ dependencies = [
  "async-channel 2.5.0",
  "futures-util",
  "gpui",
+ "libc",
  "rex-conn",
  "rex-terminal",
  "serde",

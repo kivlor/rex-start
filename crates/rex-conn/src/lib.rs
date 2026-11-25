@@ -134,11 +134,17 @@ impl Rpc {
             }
             msg = recv_json(&mut self.ws).await?;
         }
-        if let Some(err) = msg.get("error") {
+        if let Some(err) = response_error(&msg) {
             bail!("{method} failed: {}", err);
         }
         Ok(msg["payload"].clone())
     }
+}
+
+/// The `error` field of a response, if the server reported one. JSON
+/// `null` means success: only a present, non-null error fails the call.
+fn response_error(msg: &Value) -> Option<&Value> {
+    msg.get("error").filter(|err| !err.is_null())
 }
 
 /// A one-use `data.connect` ticket, decoded to its 16 bytes.
@@ -158,8 +164,17 @@ pub async fn data_ticket(rpc: &mut Rpc, session_id: &str, block_id: &str) -> Res
         .ok_or_else(|| anyhow!("no ticket in data.connect result"))?
         .to_string();
     let ticket = URL_SAFE_NO_PAD.decode(ticket).context("decoding ticket")?;
-    assert_eq!(ticket.len(), 16, "ticket must be 16 bytes");
-    Ok(ticket)
+    check_ticket(ticket)
+}
+
+/// A `data.connect` ticket is 16 raw bytes. The server controls the
+/// string, so a wrong length is an error the caller can show, not a
+/// panic.
+fn check_ticket(bytes: Vec<u8>) -> Result<Vec<u8>> {
+    if bytes.len() != 16 {
+        bail!("ticket must be 16 bytes, got {}", bytes.len());
+    }
+    Ok(bytes)
 }
 
 /// Opens a terminal data connection: WS at /api/data, binary HELLO with the
@@ -177,4 +192,29 @@ pub async fn open_data(path: &str, ticket: &[u8]) -> Result<(Ws, u64)> {
     };
     let nonce = u64::from_le_bytes(welcome[24..32].try_into().unwrap());
     Ok((ws, nonce))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn null_error_is_success() {
+        assert!(response_error(&json!({"type": "response", "error": null})).is_none());
+        assert!(response_error(&json!({"type": "response"})).is_none());
+    }
+
+    #[test]
+    fn present_error_fails_the_call() {
+        let msg = json!({"type": "response", "error": {"code": 4}});
+        assert!(response_error(&msg).is_some());
+    }
+
+    #[test]
+    fn ticket_length_is_an_error_not_a_panic() {
+        assert_eq!(check_ticket(vec![0u8; 16]).unwrap().len(), 16);
+        assert!(check_ticket(Vec::new()).is_err());
+        assert!(check_ticket(vec![0u8; 17]).is_err());
+    }
 }

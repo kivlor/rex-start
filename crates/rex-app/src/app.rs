@@ -90,7 +90,15 @@ impl RexApp {
             ClientEvent::Sessions(sessions) => {
                 self.sessions = sessions;
             }
-            ClientEvent::View(view) => {
+            ClientEvent::View(brief, view) => {
+                // A different session than the one we are showing: forget
+                // the old session's frames before drawing the new view.
+                if self.session_id.as_deref() != Some(brief.session_id.as_str()) {
+                    self.frames.clear();
+                    self.debug_frames.clear();
+                    self.session_id = Some(brief.session_id.clone());
+                    self.session_label = Some(brief.label.clone());
+                }
                 self.view = Some(view);
             }
             ClientEvent::CurrentGone => {
@@ -100,6 +108,11 @@ impl RexApp {
                 self.frames.clear();
             }
             ClientEvent::Frame(block_id, frame) => {
+                // Stale frames from a just-aborted stream of a previous
+                // session or view: keep only blocks the view still has.
+                if !self.panes().iter().any(|(id, _)| id == &block_id) {
+                    return;
+                }
                 if std::env::var_os("REX_APP_DEBUG").is_some()
                     && !self.debug_frames.contains(&block_id)
                 {

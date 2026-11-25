@@ -27,10 +27,11 @@ fn default_socket() -> String {
         .ok()
         .filter(|value| !value.starts_with("http"))
         .unwrap_or_else(|| {
-            format!(
-                "{}/rex/server.sock",
-                std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into())
-            )
+            // The runtime dir is per-user; derive it instead of assuming
+            // uid 1000.
+            let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+                .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
+            format!("{runtime_dir}/rex/server.sock")
         })
 }
 
