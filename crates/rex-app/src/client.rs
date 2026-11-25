@@ -34,6 +34,45 @@ pub enum ClientCmd {
     SwitchSession(String),
     /// `session.create`, then attach to the new session.
     NewSession(String),
+    /// `client.key`: one key press, giving the server's Lua bindings
+    /// first chance at it. Ordered server-side, serialized here too.
+    SendKey {
+        key: KeyEvent,
+        /// Earlier keys when `key` ends a sequence, e.g. `Some(["ctrl+b"])`.
+        prefix: Option<Vec<String>>,
+    },
+    /// `client.key` in chunks: paste as text, split to stay under the
+    /// server's `limits.max_message_bytes`. One call per chunk.
+    Paste(String),
+}
+
+/// One keyboard event for `client.key`: physical key name (W3C code in
+/// snake_case, `unidentified` for synthesized text), mods joined with `+`,
+/// the text it typed, and its unshifted code point for layout-dependent
+/// bindings such as `ctrl+n`.
+#[derive(Clone, Debug)]
+pub struct KeyEvent {
+    pub key: String,
+    pub mods: String,
+    pub text: String,
+    pub unshifted_codepoint: i32,
+}
+
+impl KeyEvent {
+    /// A key press as `client.key`'s `key` object. `consumed_mods` is
+    /// empty (we don't track layout-consumed shift) and `composing` is
+    /// false (GPUI gives us finished compositions).
+    fn as_json(&self) -> Value {
+        json!({
+            "key": self.key,
+            "mods": self.mods,
+            "consumed_mods": "",
+            "text": self.text,
+            "unshifted_codepoint": self.unshifted_codepoint,
+            "composing": false,
+            "action": "press",
+        })
+    }
 }
 
 /// How a split divides the anchor's space.
@@ -137,6 +176,9 @@ struct Actor {
     events: async_channel::Sender<ClientEvent>,
     sessions: Vec<SessionBrief>,
     current: Option<Current>,
+    /// The welcome's `limits.max_message_bytes`: any larger request would
+    /// close the connection (status 1009), so paste chunks under it.
+    max_message_bytes: u64,
 }
 
 /// Set `REX_APP_DEBUG=1` to see the actor's protocol progress on stderr:
@@ -163,6 +205,13 @@ async fn start_actor(
         json!({"kind": "app", "name": "rex-app", "version": env!("CARGO_PKG_VERSION")}),
     )
     .await?;
+    // Requests larger than this close the connection, so keep every
+    // paste chunk's whole JSON message under it. 1 MiB here; every
+    // server guarantees at least 64 KiB.
+    let max_message_bytes = _welcome["limits"]["max_message_bytes"]
+        .as_u64()
+        .unwrap_or(64 * 1024);
+    debug!("max_message_bytes: {max_message_bytes}");
 
     // Events that arrive while a call is waiting land in this queue; the
     // main loop drains it alongside the socket.
@@ -177,8 +226,16 @@ async fn start_actor(
         events,
         sessions: Vec::new(),
         current: None,
+        max_message_bytes,
     };
 
+    // Declare the app's own actions and their default bindings, so the
+    // server's keymap (and init.lua) knows what ctrl-alt-* does here and
+    // can rebind it. The app still handles the ctrl-alt-* keys locally
+    // first; this is a declaration, not a routing table.
+    actor.declare_keymap().await;
+
+    // ---- bootstrap: events, session list, and one session attached ----
     let mut payload = json!({"event_scope": "session"});
     if let Some(id) = actor.resolve_preferred(preferred).await? {
         payload["attach_session_ids"] = Value::from(vec![id]);
@@ -311,6 +368,10 @@ impl Actor {
                 self.switch_session(&session_id).await.map(|_| ())
             }
             ClientCmd::NewSession(label) => self.new_session(&label).await.map(|_| ()),
+            ClientCmd::SendKey { key, prefix } => {
+                self.send_key(key, prefix.as_deref()).await.map(|_| ())
+            }
+            ClientCmd::Paste(text) => self.paste(&text).await,
         };
         if let Err(error) = outcome {
             self.notice(format!("{error}")).await;
@@ -347,6 +408,132 @@ impl Actor {
             .events
             .send(ClientEvent::Sessions(self.sessions.clone()))
             .await;
+    }
+
+    /// `client.keymap`: declare the app's own actions (kind "client") and
+    /// the default layer binding the app's ctrl-alt-* keys to them.
+    /// init.lua can rebind these names; a Lua-bound key then comes back
+    /// in the keymap as `client.key.forward`, which is exactly the path
+    /// SendKey uses, so Lua bindings keep first chance at every key.
+    async fn declare_keymap(&mut self) {
+        let payload = json!({
+            "actions": [
+                {
+                    "name": "app.split",
+                    "kind": "client",
+                    "title": "Split Pane",
+                    "category": "Layouts",
+                    "description": "Split the focused pane horizontally or vertically.",
+                },
+                {
+                    "name": "app.zoom",
+                    "kind": "client",
+                    "title": "Zoom Pane",
+                    "category": "Layouts",
+                    "description": "Zoom the focused pane to fill the window, or undo the zoom.",
+                },
+                {
+                    "name": "app.picker",
+                    "kind": "client",
+                    "title": "Session Picker",
+                    "category": "Sessions",
+                    "description": "Open the session picker.",
+                },
+                {
+                    "name": "app.new_session",
+                    "kind": "client",
+                    "title": "New Session",
+                    "category": "Sessions",
+                    "description": "Create a session and open it.",
+                }
+            ],
+            "defaults": [
+                {
+                    "name": "default",
+                    "bindings": [
+                        {"keys": ["ctrl+alt+right"], "action": "app.split", "args": {"direction": "horizontal"}},
+                        {"keys": ["ctrl+alt+down"], "action": "app.split", "args": {"direction": "vertical"}},
+                        {"keys": ["ctrl+alt+z"], "action": "app.zoom"},
+                        {"keys": ["ctrl+alt+p"], "action": "app.picker"},
+                        {"keys": ["ctrl+alt+n"], "action": "app.new_session"}
+                    ]
+                }
+            ]
+        });
+        match self.rpc.call("client.keymap", payload).await {
+            Ok(keymap) => {
+                let lua_bindings = keymap["bindings"]
+                    .as_array()
+                    .map(|b| b.len())
+                    .unwrap_or(0);
+                debug!("keymap declared: {lua_bindings} resolved bindings");
+            }
+            Err(error) => {
+                // A failed declaration must not stop the app: the app's
+                // own keys still work locally.
+                debug!("client.keymap declaration failed: {error}");
+            }
+        }
+    }
+
+    /// `client.key`: one key to the focused block, Lua bindings first.
+    ///
+    /// Design: one round trip per keystroke. `client.key` runs ordered
+    /// with layout methods and this actor handles one command at a time,
+    /// so keys arrive in typed order by construction; a response per key
+    /// is imperceptible at human typing speed, and coalescing would only
+    /// help programmatic floods, which the UI never generates.
+    async fn send_key(&mut self, key: KeyEvent, prefix: Option<&[String]>) -> Result<Value> {
+        let session_id = self
+            .session_id()
+            .ok_or_else(|| anyhow!("no session"))?
+            .to_owned();
+        let mut payload = json!({"session_id": session_id, "key": key.as_json()});
+        if let Some(prefix) = prefix {
+            payload["prefix"] = Value::from(prefix);
+        }
+        let result = self.rpc.call("client.key", payload).await?;
+        debug!(
+            "client.key {} {}: handled={}",
+            if key.mods.is_empty() { "-" } else { &key.mods },
+            key.key,
+            result["handled"].as_bool().unwrap_or(false)
+        );
+        Ok(result)
+    }
+
+    /// Paste: `client.key` with a chunk of text in each call (the server
+    /// accepts multi-character `text` — verified live), chunks sized so
+    /// each request's JSON stays under `limits.max_message_bytes`; an
+    /// oversized request would close the connection. 1 KiB of margin for
+    /// the JSON envelope, floored at 1 KiB in case a server advertises
+    /// the bare 64 KiB minimum.
+    async fn paste(&mut self, text: &str) -> Result<()> {
+        let session_id = self
+            .session_id()
+            .ok_or_else(|| anyhow!("no session"))?
+            .to_owned();
+        let margin = 1024;
+        let chunk_bytes = (self.max_message_bytes.saturating_sub(margin) as usize).max(1024);
+        let mut sent = 0;
+        for chunk in chunk_text(text, chunk_bytes) {
+            let key = KeyEvent {
+                key: "unidentified".into(),
+                mods: String::new(),
+                text: chunk.to_owned(),
+                unshifted_codepoint: 0,
+            };
+            let payload = json!({"session_id": session_id, "key": key.as_json()});
+            let result = self.rpc.call("client.key", payload).await?;
+            sent += chunk.len();
+            debug!(
+                "paste chunk {} bytes (total {}): handled={}",
+                chunk.len(),
+                sent,
+                result["handled"].as_bool().unwrap_or(false)
+            );
+        }
+        Ok(())
     }
 
     /// `session.new_split`: one shell block beside the focused block of
@@ -692,6 +879,25 @@ async fn stream_block(
         }
     }
     Ok(())
+}
+
+/// Splits `text` into chunks of at most `max_bytes`, never breaking a
+/// character: paste text is UTF-8, and a chunk boundary inside a code
+/// point would send invalid bytes to the terminal.
+fn chunk_text<'a>(text: &'a str, max_bytes: usize) -> impl Iterator<Item = &'a str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let mut end = rest.len().min(max_bytes);
+        while end > 0 && !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        let (chunk, tail) = rest.split_at(end);
+        rest = tail;
+        Some(chunk)
+    })
 }
 
 #[cfg(test)]
