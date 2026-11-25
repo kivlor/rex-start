@@ -136,6 +136,15 @@ pub enum ClientEvent {
     /// Sent after the `client.keymap` declaration and after every
     /// `keymap_changed` that changes the config hash.
     Keymap(HashSet<String>),
+    /// A claim (`session.own_block` or its resize) failed: `reason` for
+    /// the status bar, and `block_id` so the UI drops its cached request
+    /// and the next render retries instead of sticking to the server's
+    /// old grid until the window reactivates.
+    OwnFailed { block_id: String, reason: String },
+    /// A block we had claimed came back to us — the foreign taker gave it
+    /// up, detached, or lost its connection and we were in line. The UI
+    /// re-claims at its own fitting grid.
+    BlockReturned(String),
     /// The control connection ended; the UI can say so.
     Closed(String),
 }
@@ -539,7 +548,26 @@ impl Actor {
                 block_id,
                 cols,
                 rows,
-            } => self.own_block(&block_id, cols, rows).await.map(|_| ()),
+            } => {
+                // A failed claim must reach the UI as an `OwnFailed`, not
+                // just a notice: `claim_panes` only re-sends when its cached
+                // grid differs, so without this the pane would render at
+                // the server's old grid until the grid changes or the
+                // window reactivates. The UI clears its entry and retries
+                // on the next render.
+                match self.own_block(&block_id, cols, rows).await {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        let reason = format!("claim {block_id} failed: {error}");
+                        self.notice(reason.clone()).await;
+                        let _ = self
+                            .events
+                            .send(ClientEvent::OwnFailed { block_id, reason })
+                            .await;
+                        Ok(())
+                    }
+                }
+            }
             ClientCmd::DisownAll => self.disown_all().await.map(|_| ()),
         };
         if let Err(error) = outcome {
@@ -782,7 +810,7 @@ impl Actor {
                 }),
             )
             .await?;
-        self.record_owners(&result, &[block_id]);
+        Self::record_owners(&mut self.owners, &result, &[block_id]);
         debug!(
             "own_block {block_id} at {cols}x{rows}: owner={}",
             self.owners
@@ -826,7 +854,14 @@ impl Actor {
             .owners
             .values()
             .any(|owner| owner.as_deref() == Some(self.my_client_id.as_str()));
-        if !ours && self.last_grid.is_empty() {
+        // Owning nothing means nothing to give up: every path that grants
+        // us a block (own_block results, `block_owner_changed`) records
+        // it in `owners`, so a non-ours map with stale `last_grid` entries
+        // is exactly that — stale. `set_current` clears both maps on a
+        // session switch, so the guard is a no-op skip, never a missed
+        // release. (The old `!ours && last_grid.is_empty()` form kept a
+        // stale entry sending a pointless disown round trip.)
+        if !ours {
             return Ok(());
         }
         let session_id = self
@@ -837,15 +872,21 @@ impl Actor {
             .rpc
             .call("session.disown_block", json!({"session_id": session_id}))
             .await?;
-        self.record_owners(&result, &[]);
+        Self::record_owners(&mut self.owners, &result, &[]);
         self.last_grid.clear();
         debug!("disowned every block in {session_id}");
         Ok(())
     }
 
     /// Records the owners an own_block/disown_block result reports for
-    /// `block_ids` (or every block in the result when empty).
-    fn record_owners(&mut self, result: &Value, block_ids: &[&str]) {
+    /// `block_ids` (or every block in the result when empty). Associated,
+    /// not a method: pure map surgery, so the unit tests exercise it
+    /// without an actor.
+    fn record_owners(
+        owners: &mut HashMap<String, Option<String>>,
+        result: &Value,
+        block_ids: &[&str],
+    ) {
         for entry in result["blocks"].as_array().into_iter().flatten() {
             let Some(block_id) = entry["block_id"].as_str() else {
                 continue;
@@ -854,7 +895,7 @@ impl Actor {
                 continue;
             }
             let owner = entry["owner"].as_str().map(str::to_owned);
-            self.owners.insert(block_id.to_owned(), owner);
+            owners.insert(block_id.to_owned(), owner);
         }
     }
 
@@ -1166,6 +1207,26 @@ impl Actor {
                         self.notice(format!("block {block_id} taken by {who}"))
                             .await;
                     }
+                    // The opposite turn: a foreign owner gave the block
+                    // back and we were in line — `lost`/`disconnect` (the
+                    // taker's connection or attachment ended). Reasons
+                    // `take`/`request` are our own claims (the actor's
+                    // own_block already handles those), so they're skipped.
+                    // Forget our grid so the coalescing can't block, and
+                    // tell the UI to re-claim: `claim_panes` is app-side,
+                    // and without this the pane would render at the
+                    // taker's grid until the window reactivates.
+                    if owner.as_deref() == Some(self.my_client_id.as_str())
+                        && previous.as_deref() != Some(self.my_client_id.as_str())
+                        && !matches!(reason.as_str(), "take" | "request")
+                    {
+                        self.last_grid.remove(&block_id);
+                        debug!("block {block_id} returned to us, re-claiming");
+                        let _ = self
+                            .events
+                            .send(ClientEvent::BlockReturned(block_id.clone()))
+                            .await;
+                    }
                 }
                 // block_created, window_created, focus changes, and the
                 // rest all show up in the next view.
@@ -1237,9 +1298,57 @@ async fn stream_block(
 }
 #[cfg(test)]
 mod tests {
-    use super::{default_local_keys, key_is_ours, normalize_key, revision_is_newer};
+    use super::{default_local_keys, key_is_ours, normalize_key, revision_is_newer, Actor};
     use serde_json::json;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn record_owners_sets_and_clears_owners_from_results() {
+        let mut owners: HashMap<String, Option<String>> = HashMap::new();
+        // An own_block result: both blocks claimed, one already released by
+        // a third party (owner left out).
+        let result = json!({"blocks": [
+            {"block_id": "block:a", "owner": "client:me"},
+            {"block_id": "block:b"}
+        ]});
+        Actor::record_owners(&mut owners, &result, &["block:a", "block:b"]);
+        assert_eq!(
+            owners.get("block:a").map(Option::as_deref),
+            Some(Some("client:me"))
+        );
+        assert_eq!(owners.get("block:b").map(Option::as_deref), Some(None));
+        // A disown result (no block_ids): every reported block updates,
+        // even ones not claimed by this call — ownership cleared.
+        let cleared = json!({"blocks": [{"block_id": "block:a"}]});
+        Actor::record_owners(&mut owners, &cleared, &[]);
+        assert_eq!(owners.get("block:a").map(Option::as_deref), Some(None));
+    }
+
+    #[test]
+    fn record_owners_block_ids_filter_skips_unlisted_blocks() {
+        let mut owners: HashMap<String, Option<String>> = HashMap::new();
+        owners.insert("block:other".into(), Some("client:someone".into()));
+        // A result listing more than we asked about: only the requested
+        // block's entry changes; entries outside the filter are kept.
+        let result = json!({"blocks": [
+            {"block_id": "block:mine", "owner": "client:me"},
+            {"block_id": "block:other"}
+        ]});
+        Actor::record_owners(&mut owners, &result, &["block:mine"]);
+        assert_eq!(
+            owners.get("block:mine").map(Option::as_deref),
+            Some(Some("client:me"))
+        );
+        assert_eq!(
+            owners.get("block:other").map(Option::as_deref),
+            Some(Some("client:someone"))
+        );
+        // Malformed entries (no block_id) and a missing blocks array are
+        // skipped, not fatal.
+        Actor::record_owners(&mut owners, &json!({"blocks": [{"owner": "x"}]}), &[]);
+        Actor::record_owners(&mut owners, &json!({}), &[]);
+        assert_eq!(owners.len(), 2);
+    }
 
     #[test]
     fn revision_must_be_strictly_newer() {

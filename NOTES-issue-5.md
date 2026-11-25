@@ -329,6 +329,73 @@ files untouched.
 - Cleanup: no test sessions remain (`rex ls` empty); no probe-stream-*.bin
   generated; the two committed fixture .bin files untouched.
 
+## Review feedback (PR #10) — designs and decisions
+
+Four non-blocking review items, addressed in one commit.
+
+### 1. A failed claim is retried, not stuck
+
+The bug: `claim_panes` cached its grid in `own_requests` *before* the
+actor ran the claim, so a failed `session.own_block`/resize RPC left the
+pane rendering at the server's old grid until the grid changed or the
+window reactivated. Fix: new `ClientEvent::OwnFailed { block_id, reason }`.
+When the actor's `own_block` fails, `command`'s OwnBlock arm sends it
+(plus the usual `Notice`, which puts the reason in the status bar);
+app-side, `on_client_event` removes the `own_requests` entry for that
+block, so the next render — which recomputes the fitting grid every
+frame — retries. One event carries both the reason and the retry
+trigger; no new state, no timers.
+
+### 2. One pane-pixel helper
+
+The pane pixel math lived twice, in `claim_panes` and `render` — drift
+would have mis-sized the claimed grid against the drawn pane. Now one
+free function, `app::pane_pixels(viewport, rect)`: rect fractions of the
+viewport minus the 26px header, minus the 3px gutter, floored at 1px.
+Both call sites use it; a unit test pins the header/gutter arithmetic
+and the 1px floor.
+
+### 3. `disown_all` guard tightened
+
+Old guard: `!ours && last_grid.is_empty()`. A client owning nothing but
+holding a stale `last_grid` entry still sent a pointless disown round
+trip. Every path that grants us a block (own_block results,
+`block_owner_changed`) records it in `owners`, and `set_current` clears
+both maps on a session switch — so "we own nothing" is a complete skip
+condition: `if !ours { return }`. The comment in the code says why that's
+safe.
+
+### 4. A block handed back to us re-claims immediately
+
+The gap: a foreign taker's disconnect (`lost`) or detach (`disconnect`)
+passed the block back to us (we were in line), but nothing re-claimed
+our grid — the pane rendered at the taker's grid until reactivation.
+Decision: in the `block_owner_changed` handler, when `owner == us`,
+`previous != us`, and the reason is NOT `take`/`request` (those are our
+own claims, which `own_block` already handles — excluding them avoids a
+spurious clear/re-claim churn on every own), the actor removes the
+block's `last_grid` entry (so its coalescing can't swallow the retry)
+and sends a new `ClientEvent::BlockReturned(block_id)`. App-side, the
+handler removes the `own_requests` entry; the next render — window
+active, frames arriving — re-runs `claim_panes`, which re-claims via
+`OwnBlock` at our current fitting grid, and the actor resizes since its
+`last_grid` is empty. Payload shape confirmed from `docs/API-rev19.md`
+§`block_owner_changed`: `block_id`, `owner` (new, left out when none),
+`previous`, `reason`. `owner == None` with `previous != us` is left
+alone: we held no claim on it, so there is nothing of ours to restore.
+
+### 5. New unit tests
+
+- `record_owners` (was an Actor method, now an associated fn taking the
+  owners map, so it's testable without an actor): owner set from an
+  own_block result, owner cleared when left out (disown shape), the
+  `block_ids` filter skipping unlisted blocks while keeping their
+  entries, and malformed/missing `blocks` skipped without harm.
+- `Fed.resize` parsing (`rex-terminal`): a crafted resize APC through a
+  real `Replica` — cell pixels flow through, missing fields default to
+  0, last resize of a feed wins, the terminal clamps to 1x1 while `Fed`
+  reports the raw grid, and feeds without a resize report `None`.
+
 ## Left for #6
 
 - The graceful-close path (window X → actor's end-of-loop `disown_all`)
