@@ -20,7 +20,9 @@ Mac/iOS over SSH/Tailscale, and vice versa.
   Ghostty snapshot + raw PTY stream to a file, `rex1` APC control messages
   (resize / theme / child_exited) decoded by nonce, screen read via
   `com.superlogical.terminal.format`. Leaves the session running on the server.
-- [ ] Render the stream through `libghostty` (restore snapshot, feed PTY bytes)
+- [x] Render the stream through `libghostty` (`crates/rex-terminal`: restore
+      snapshot, feed PTY bytes, apply rex1 messages by nonce; `replay` binary
+      renders captured streams offline)
 - [ ] GPUI window: single pane → splits/zoom → session picker
 - [ ] Key input through `client.key` (so `init.lua` bindings see keys first)
 - [ ] Resize ownership (`session.own_block`) — claim blocks, request grids
@@ -30,7 +32,7 @@ Mac/iOS over SSH/Tailscale, and vice versa.
 
 ```sh
 rex server start            # personal server, idempotent (sessions run as you)
-cargo run --release -- --command pi --label pi-demo --seconds 10
+cargo run -p probe --release -- --command pi --label pi-demo --seconds 10
 rex ls                      # session stays alive after the probe exits
 rex capture -s pi-demo      # view the pane from the CLI
 rex kill pi-demo            # end it (kill takes labels positionally)
@@ -38,6 +40,18 @@ rex kill pi-demo            # end it (kill takes labels positionally)
 
 Other flags: `--socket` (default `$XDG_RUNTIME_DIR/rex/server.sock`),
 `--seconds` (stream deadline, default 15).
+
+## Replaying a captured stream
+
+```sh
+mise install                  # once: Zig 0.17 for ghostty-vt-sys (pinned in mise.toml)
+cargo run -p rex-terminal --bin replay -- probe-stream-pi-demo.bin
+# or force the channel nonce: ... -- probe-stream-X.bin --nonce 123456789
+```
+
+The nonce defaults to the one in the stream's first rex1 APC. The first build
+of `ghostty-vt-sys` compiles libghostty-vt from its official source tarball
+(takes a few minutes).
 
 ## Reference
 
@@ -57,5 +71,12 @@ Other flags: `--socket` (default `$XDG_RUNTIME_DIR/rex/server.sock`),
 - `session.attach` is required before `data.connect`; a data connection is
   never compressed and must send HELLO within 5s.
 - `com.superlogical.terminal.write` is a block method: args nest under `args`.
-- The rex1 APC (`ESC _ rex1;<nonce>;<json> ESC \`) tells resize/theme/exit
-  inside the PTY stream; check the nonce so program output can't spoof it.
+- The rex1 APC (`ESC _ rex1;<nonce>;<json> ESC \`) tells resize/theme/exit;
+  the nonce comes from the data WELCOME and must be checked, because a
+  program can print look-alikes. `rex-terminal` owns that parsing now.
+- `ghostty-vt` is pinned to crates.io `0.9.0+ghostty-vt.1.0.1` (libghostty-vt
+  1.0.1, MIT/Apache-2.0). The issue named 0.8.0, but 0.9.0 is the current
+  release and builds fine here via its sys crate; it needs Zig 0.17 on PATH
+  (or `mise exec`/`mise.toml`, which pins `zig = "0.17.1"`).
+- `cargo clippy` catches a `never_loop` in probe's old control-message
+  reader; keep the workspace clean before merging.
