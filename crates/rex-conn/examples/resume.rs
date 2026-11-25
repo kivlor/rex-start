@@ -18,6 +18,12 @@
 //! control connection dropped and re-helloed with its `reconnect_token`
 //! must keep the same `client.id` with `resumed: true`.
 //!
+//! With `--lapse` (adds ~70 s): the same drop, but held past the ~60 s
+//! token window -- the reconnect must come back `resumed: false` with a
+//! NEW `client.id`. That is the premise of rex-app's `catch_up` fix: a
+//! long outage hands the client a fresh id while its `owners` map still
+//! attributes its blocks to the old one.
+//!
 //! Cleans up after itself (`session.destroy`).
 
 use anyhow::{anyhow, bail, Result};
@@ -265,13 +271,50 @@ async fn run() -> Result<()> {
     drop(cws); // unclean drop of the attached control connection
     tokio::time::sleep(Duration::from_millis(300)).await;
     let cws2 = connect(&socket, "/api/control", "rex.control.v1").await?;
-    let (_cws2, welcome2) = hello_with_token(cws2, client, Some(&token1)).await?;
+    let (_cws2, welcome2) = hello_with_token(cws2, client.clone(), Some(&token1)).await?;
     let resumed = welcome2["client"]["resumed"].as_bool().unwrap_or(false);
     let same_id = welcome2["client"]["id"].as_str() == Some(id1.as_str());
     if !resumed || !same_id {
         bail!("control reconnect: resumed={resumed}, same id={same_id}");
     }
     println!("PASS control reconnect: client id {id1} survives the drop, resumed: true");
+
+    // ---- optional: a drop held past the ~60 s token window ----
+    // A NEW client id here is what rex-app's `catch_up` handles: the
+    // re-attach updates `my_client_id`, and its re-claim must treat
+    // blocks still mapped to the OLD id as ours.
+    if std::env::args().any(|arg| arg == "--lapse") {
+        use futures_util::SinkExt as _;
+        let cws3 = connect(&socket, "/api/control", "rex.control.v1").await?;
+        let (mut cws3, welcome3) = hello_with_token(cws3, client.clone(), Some(&token1)).await?;
+        let id3 = welcome3["client"]["id"]
+            .as_str()
+            .expect("client id")
+            .to_owned();
+        let token3 = welcome3["client"]["reconnect_token"]
+            .as_str()
+            .expect("reconnect_token")
+            .to_owned();
+        assert_eq!(id3, id1, "the token still carries client {id1}");
+        let attach = json!({"type": "request", "id": "1", "method": "session.attach",
+                            "payload": {"session_id": &session_id}});
+        cws3.send(Message::Text(attach.to_string().into())).await?;
+        let _ = cws3.next().await;
+        println!("lapse: attached as {id3}, holding the drop past the token window (~70 s)...");
+        drop(cws3);
+        tokio::time::sleep(Duration::from_secs(70)).await;
+        let cws4 = connect(&socket, "/api/control", "rex.control.v1").await?;
+        let (_cws4, welcome4) = hello_with_token(cws4, client.clone(), Some(&token3)).await?;
+        let resumed = welcome4["client"]["resumed"].as_bool().unwrap_or(false);
+        let id4 = welcome4["client"]["id"]
+            .as_str()
+            .expect("client id")
+            .to_owned();
+        if resumed || id4 == id1 {
+            bail!("lapse reconnect: resumed={resumed}, id {id4} (expected a NEW id, not {id1})");
+        }
+        println!("PASS lapse reconnect: old id {id1} forgotten, NEW client id {id4} issued");
+    }
 
     // ---- clean up ----
     rpc.call("session.destroy", json!({"session_id": session_id}))

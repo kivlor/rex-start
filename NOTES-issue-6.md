@@ -263,3 +263,77 @@ path: no keepalive timeout within 420s (the server's 3-strike window is
 - Functional: `REX_APP_HEADLESS=8 REX_APP_DEBUG=1 cargo run -p rex-app --
   --new-session` — frames logged compactly (see below); the session it
   created was `rex kill`ed; `rex ls` left empty.
+
+## Review-fix round 2 (PR #11 external review)
+
+### BLOCKING: no re-claim after a >60s lapse (new client id)
+
+**Bug.** After a token lapse the server forgets the old client and the
+re-attach hands us a NEW client id. `catch_up` updated `my_client_id`,
+but `owners` still mapped our blocks to the OLD id (the
+`block_owner_changed` events fired during the outage are lost), and the
+re-claim filter was `owner == my_client_id` — matching nothing. No
+blocks were re-claimed or re-gridded; the panes rendered at whatever
+grid the server last had until window reactivation. The old comment
+claiming the `client_id` re-read covers this was wrong: the re-read is
+exactly what makes the filter miss.
+
+**Fix.** The actor now tracks `former_client_ids` (every id we held
+before the current one; `set_client_id` records the previous id on each
+change, used by bootstrap and `catch_up`'s re-attach). The re-claim set
+is computed by a pure associated fn, `Actor::reclaims(owners,
+last_grid, my_client_id, former_client_ids)`: blocks the owners map
+attributes to ANY of our ids (current or former) that have a grid to
+re-apply. `catch_up` re-claims that set with a fresh `own_block` take —
+legitimate, since the old client is dead server-side so its blocks are
+unowned — and `own_block`'s `record_owners` re-records the entries
+under the new id (verified: `record_owners` inserts unconditionally).
+`disown_all`'s "do we own anything" guard now uses the same
+current-or-former test (`is_our_id`), so a failed re-claim (old-id entry
+left in the map) still disowns properly.
+
+**Evidence.**
+- Unit: `reclaims_covers_blocks_owned_under_a_former_client_id`
+  (old-id + new-id entries both reclaimed; foreign/unowned/no-grid
+  excluded) and `reclaims_without_the_old_id_misses_the_old_blocks`
+  (the pre-fix filter, shown to miss — the bug, reproduced).
+- Live (bounded, ~75 s): `resume.rs --lapse` — a control drop held
+  past the ~60 s token window returns `resumed: false` with a NEW
+  `client.id` (`PASS lapse reconnect: old id … forgotten, NEW client id
+  … issued`). That validates the premise end-to-end: the id does
+  change; the map-vs-id mismatch it creates is exactly what
+  `reclaims`'s unit tests cover. A full GUI lapse (kill the GUI's
+  control path for 60 s+ and watch it re-grid) was judged impractical
+  to script; the premise is live-verified, the logic unit-verified.
+
+### Non-blocking
+
+1. **Server restart → stale view** — DONE. `catch_up` now adopts the
+   re-attach's view unconditionally: after a restart the revision
+   sequence starts over, so the fresh view can be LOWER than the stale
+   one and the old `revision >=` gate dropped it. The re-attach's view
+   is the truth by construction; revision gating stays on the
+   connected paths (`refresh_view`, event handlers).
+2. **`replica.feed` error ends the stream silently** — DONE. A decode
+   failure now surfaces as `ClientEvent::Notice("block <id>: stream
+   ended: <error>")` before the task returns the error.
+3. **Stale ticket requests during long reconnects** — ASSESSED, cheap
+   guard added. A queued request whose stream task died gets its
+   oneshot reply dropped; `fresh_ticket` treats a dropped oneshot as a
+   bail and `reply.send` failing is not an error worth acting on. The
+   ticket RPC is wasted, not lost work; nothing hangs (the 30 s
+   timeout in `fresh_ticket` bounds the wait while the actor is
+   unreachable). Added a debug log when the reply is dropped so the
+   waste is visible under `REX_APP_DEBUG`.
+
+### Checks (this round)
+
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+  -- -D warnings`, `cargo test --workspace` (60 tests): all green.
+- `resume` example: all PASS (3 resumes, 0x03/0x05 rejections, control
+  reconnect `resumed: true`); `own_block` example: all PASS.
+- `resume --lapse`: PASS (see above), session destroyed.
+- GUI smoke (`REX_APP_DEBUG=1 … timeout 12 … --new-session`): bootstrap,
+  own_block at 121x38, resize matching cell metrics, view refresh —
+  clean; session `rex kill`ed.
+- Cleanup: `rex ls` empty, checked twice. No pushes, no PRs.
