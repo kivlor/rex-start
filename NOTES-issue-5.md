@@ -203,7 +203,56 @@ and the owner may be another client.
 
 ## Step 3 — evidence (filled in after live runs)
 
-(to be recorded)
+Example: `crates/rex-conn/examples/own_block.rs` (pattern of client_key.rs).
+Run: `mise exec -- cargo run -p rex-conn --example own_block` (full output in
+the commit message and reproduced here). Live run 2026-11-25, server pid
+revision 19:
+
+```
+client 1 connected
+session session:01a210ed-5af0-744e-96c6-a6a417d69721
+client 1 is client:01a210ed-5af0-7036-80d0-9019558a6e6c
+block block:01a210ed-5af0-7545-ad6f-49bceab60f20
+own_block 40x12: owner=client:01a210ed-5af0-7036-80d0-9019558a6e6c
+PASS resize rex1 says 40x12 at 9x18px
+PASS stty size reports "12 40" (rows cols) for 40x12
+own_block 100x30: owner=client:01a210ed-5af0-7036-80d0-9019558a6e6c
+PASS resize rex1 says 100x30 after re-own
+PASS stty size reports "30 100" (rows cols) for 100x30
+client 2 took the block; owner now client:01a210ed-5e7e-7bd1-a0f4-ca8754fa6f04
+client 1 saw block_owner_changed: owner=client:01a210ed-5af0-7036-80d0-9019558a6e6c previous=none reason=take
+client 1 saw block_owner_changed: owner=client:01a210ed-5e7e-7bd1-a0f4-ca8754fa6f04 previous=client:01a210ed-5af0-7036-80d0-9019558a6e6c reason=take
+PASS client 1 saw block_owner_changed (exclusivity, no fight)
+PASS block followed client 2's grid: resize rex1 says 66x22
+PASS stty size reports "22 66" (rows cols) from client 2's grid
+client 1 saw block_owner_changed: owner=client:01a210ed-5af0-7036-80d0-9019558a6e6c previous=client:01a210ed-5e7e-7bd1-a0f4-ca8754fa6f04 reason=disown
+PASS disown kept the block alive; grid now 100x30 (our deferred resize applied)
+PASS client 1 still sizes the block after handback: "16 50"
+all checks passed; session destroyed
+```
+
+Findings recorded along the way:
+
+- Grid reflow verified twice (40x12 then 100x30), each two ways: the
+  `resize` rex1 on the data stream (cols/rows + 9x18 cell px echo) and the
+  program's own `stty size` via `com.superlogical.terminal.format`.
+- `block_owner_changed` seen by client 1 when client 2 took the block
+  (owner=client2, previous=client1, reason=take), and the block's grid
+  followed client 2's 66x22, verified both ways again.
+- `session.view` does NOT report block owners (verified live earlier with
+  ownprobe/ownprobe2), despite the doc's "session.view shows owners" note —
+  owners are tracked from own/disown results and events.
+- Deferred-resize semantics confirmed: a `terminal.resize` sent while
+  another client owns applies "when the caller becomes the owner" — our
+  100x30 request applied the moment client 2 disowned and the block passed
+  back to us (the in-line `take` claimer). The first draft of the example
+  mistook this for a bug; it's documented behavior (API doc, resize notes).
+- The example runs the data-stream replica on a LocalSet (libghostty
+  iterators are !Send), like the app's actor.
+- Sessions destroyed by the example itself (`session.destroy`); the two
+  manual probe sessions (ownprobe, ownprobe2) killed with `rex kill`.
+- Cell-px cross-check number from the live server: resize rex1 reported
+  9x18px, exactly the `CELL_W_PX`/`CELL_H_PX` metrics we sent.
 
 ## Step 4 — GUI smoke (filled in after live runs)
 
