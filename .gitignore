@@ -1,2 +1,12 @@
+# Rust
 /target
+**/*.rs.bk
+
+# probe output (Ghostty snapshots + PTY dumps)
 probe-stream-*.bin
+
+# editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
