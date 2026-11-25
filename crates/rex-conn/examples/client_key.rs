@@ -19,12 +19,15 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 fn socket_path() -> String {
-    std::env::var("REX_SERVER").ok().filter(|s| !s.starts_with("http")).unwrap_or_else(|| {
-        format!(
-            "{}/rex/server.sock",
-            std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into())
-        )
-    })
+    std::env::var("REX_SERVER")
+        .ok()
+        .filter(|s| !s.starts_with("http"))
+        .unwrap_or_else(|| {
+            format!(
+                "{}/rex/server.sock",
+                std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".into())
+            )
+        })
 }
 
 /// One key press as `client.key`'s `key` object.
@@ -50,7 +53,9 @@ async fn main() -> Result<()> {
         json!({"kind": "cli", "name": "client-key-example", "version": env!("CARGO_PKG_VERSION")}),
     )
     .await?;
-    let max_message_bytes = welcome["limits"]["max_message_bytes"].as_u64().unwrap_or(64 * 1024);
+    let max_message_bytes = welcome["limits"]["max_message_bytes"]
+        .as_u64()
+        .unwrap_or(64 * 1024);
     let mut rpc = Rpc::new(ws, |_| {});
 
     println!("connected; max_message_bytes = {max_message_bytes}");
@@ -64,7 +69,10 @@ async fn main() -> Result<()> {
             ]}),
         )
         .await?;
-    let session_id = created["session_id"].as_str().expect("session_id").to_owned();
+    let session_id = created["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
     let view = rpc
         .call("session.attach", json!({"session_id": session_id}))
         .await?;
@@ -90,7 +98,10 @@ async fn main() -> Result<()> {
                 json!({"session_id": session_id, "block_id": block_id, "args": {"format": "text", "trim": true}}),
             )
             .await?;
-        Ok(text["content"].as_str().expect("content in format result").to_owned())
+        Ok(text["content"]
+            .as_str()
+            .expect("content in format result")
+            .to_owned())
     }
 
     async fn wait_output() {
@@ -105,7 +116,12 @@ async fn main() -> Result<()> {
     wait_output().await;
 
     // ---- plain text in one multi-character call, then Enter ----
-    send_key(&mut rpc, &session_id, key_event("key_h", "", "hello-from-client-key", 104)).await?;
+    send_key(
+        &mut rpc,
+        &session_id,
+        key_event("key_h", "", "hello-from-client-key", 104),
+    )
+    .await?;
     send_key(&mut rpc, &session_id, key_event("enter", "", "", 13)).await?;
     wait_output().await;
     let text = screen(&mut rpc, &session_id, &block_id).await?;
@@ -121,9 +137,7 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| (max_message_bytes.saturating_sub(1024) as usize).max(1024));
-    let lines: Vec<String> = (0..5000)
-        .map(|i| format!("paste-line-{i:05}"))
-        .collect();
+    let lines: Vec<String> = (0..5000).map(|i| format!("paste-line-{i:05}")).collect();
     let paste = lines.join("\n");
     println!(
         "pasting {} bytes in chunks of {}",
@@ -148,14 +162,28 @@ async fn main() -> Result<()> {
     wait_output().await;
     let text = screen(&mut rpc, &session_id, &block_id).await?;
     if !text.contains("paste-line-04999") {
-        bail!("paste did not arrive whole; screen tail:\n{}", text.chars().rev().take(2000).collect::<String>().chars().rev().collect::<String>());
+        bail!(
+            "paste did not arrive whole; screen tail:\n{}",
+            text.chars()
+                .rev()
+                .take(2000)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        );
     }
     println!("PASS multi-KB paste ({chunks} chunks, end marker present)");
 
     // ---- ctrl combo: ctrl+d ends cat, the shell returns ----
     send_key(&mut rpc, &session_id, key_event("key_d", "ctrl", "", 100)).await?;
     wait_output().await;
-    send_key(&mut rpc, &session_id, key_event("key_e", "", "echo ctrl-d-worked", 101)).await?;
+    send_key(
+        &mut rpc,
+        &session_id,
+        key_event("key_e", "", "echo ctrl-d-worked", 101),
+    )
+    .await?;
     send_key(&mut rpc, &session_id, key_event("enter", "", "", 13)).await?;
     wait_output().await;
     let text = screen(&mut rpc, &session_id, &block_id).await?;
