@@ -101,6 +101,10 @@ pub struct Fed {
     pub changed: bool,
     /// The terminal's program exited with this code.
     pub exited: Option<i64>,
+    /// The grid the server reported in a `resize` rex1 this feed, as
+    /// (cols, rows, cell_width_px, cell_height_px). Cell pixels are 0
+    /// when the server doesn't know them. The last one wins.
+    pub resize: Option<(u32, u32, u32, u32)>,
 }
 
 /// A libghostty terminal mirroring one Rex terminal stream.
@@ -347,6 +351,12 @@ fn apply_message(terminal: &mut Terminal, message: RexMessage, fed: &mut Fed) {
                 cell_width_px.max(1),
                 cell_height_px.max(1),
             );
+            fed.resize = Some((
+                u32::from(cols),
+                u32::from(rows),
+                cell_width_px,
+                cell_height_px,
+            ));
         }
         RexMessage::Theme {
             foreground,
@@ -445,6 +455,32 @@ mod tests {
         assert_eq!(frame.cols, 30);
         assert_eq!(row_text(&frame.cells[0]), "hello world!");
         assert!(frame.cursor.is_some());
+    }
+
+    #[test]
+    fn reports_the_grid_a_resize_rex1_carries() {
+        // The resize-rex1 → `Fed::resize` parsing path, as the app's data
+        // stream consumes it: cell pixels flow through, missing fields
+        // default to 0, the last resize of a feed wins, and the terminal
+        // itself clamps to at least 1x1 while `Fed` reports the raw grid.
+        let mut first = snapshot_of(b"", 10, 2);
+        first.extend_from_slice(
+            b"\x1b_rex1;7;{\"type\":\"resize\",\"cols\":40,\"rows\":12,\"cell_width_px\":9,\"cell_height_px\":18}\x1b\\",
+        );
+        let mut second =
+            b"\x1b_rex1;7;{\"type\":\"resize\",\"cols\":80,\"rows\":24}\x1b\\".to_vec();
+        second.extend_from_slice(b"\x1b_rex1;7;{\"type\":\"resize\",\"cols\":0,\"rows\":0}\x1b\\");
+
+        let mut replica = Replica::new(7).unwrap();
+        let fed = replica.feed(&first).unwrap();
+        assert_eq!(fed.resize, Some((40, 12, 9, 18)));
+        let fed = replica.feed(&second).unwrap();
+        // The second feed carried two resizes: the last one wins.
+        assert_eq!(fed.resize, Some((0, 0, 0, 0)));
+        // But the terminal was resized along the way, clamped to 1x1.
+        assert_eq!(replica.size(), Some((1, 1)));
+        // Feeds without a resize report none.
+        assert_eq!(replica.feed(b"x").unwrap().resize, None);
     }
 
     #[test]

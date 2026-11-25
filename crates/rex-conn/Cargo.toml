@@ -8,5 +8,9 @@ anyhow = "1"
 base64 = "0.22"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 serde_json = "1"
-tokio = { version = "1", features = ["net", "macros", "rt", "time"] }
+tokio = { version = "1", features = ["net", "macros", "rt", "sync", "time"] }
 tokio-tungstenite = "0.28"
+
+[dev-dependencies]
+# Used by the own_block example to parse the data stream's rex1 messages.
+rex-terminal = { path = "../rex-terminal" }

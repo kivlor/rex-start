@@ -14,6 +14,22 @@ use rex_terminal::{Color, Frame};
 /// The system's monospace font, resolved once and reused for every pane.
 pub const MONO: &str = "DejaVu Sans Mono";
 
+/// The design cell, in pixels: the size the non-stretch layout draws a
+/// frame at (see `request_layout`). Grid negotiation asks for cols/rows
+/// that fit a pane at this cell size, so the server's programs are
+/// sized for how this client actually renders.
+pub const CELL_W_PX: f32 = 9.0;
+pub const CELL_H_PX: f32 = 18.0;
+
+/// The grid that fits a pane of `pane_w` x `pane_h` pixels: floor
+/// division by the cell size, never below 1x1 (the protocol's minimum)
+/// and capped at the protocol's 65535.
+pub fn grid_for(pane_w: f32, pane_h: f32) -> (u32, u32) {
+    let cols = (pane_w.max(0.0) / CELL_W_PX).floor() as u32;
+    let rows = (pane_h.max(0.0) / CELL_H_PX).floor() as u32;
+    (cols.clamp(1, 65535), rows.clamp(1, 65535))
+}
+
 /// One block's terminal, ready to draw.
 pub struct TerminalElement {
     frame: Arc<Frame>,
@@ -68,8 +84,8 @@ impl Element for TerminalElement {
             style.size.width = gpui::Length::Definite(gpui::DefiniteLength::Fraction(1.0));
             style.size.height = gpui::Length::Definite(gpui::DefiniteLength::Fraction(1.0));
         } else {
-            style.size.width = px(f32::from(self.frame.cols) * 9.0).into();
-            style.size.height = px(f32::from(self.frame.rows) * 18.0).into();
+            style.size.width = px(f32::from(self.frame.cols) * CELL_W_PX).into();
+            style.size.height = px(f32::from(self.frame.rows) * CELL_H_PX).into();
         }
         (window.request_layout(style, [], cx), ())
     }
@@ -231,4 +247,50 @@ fn text_run(foreground: Color, len: usize) -> TextRun {
 
 fn color(value: Color) -> gpui::Rgba {
     rgb((u32::from(value.r) << 16) | (u32::from(value.g) << 8) | u32::from(value.b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{grid_for, CELL_H_PX, CELL_W_PX};
+
+    #[test]
+    fn exact_division_gives_the_exact_grid() {
+        assert_eq!(grid_for(9.0 * 80.0, 18.0 * 24.0), (80, 24));
+        assert_eq!(grid_for(CELL_W_PX, CELL_H_PX), (1, 1));
+    }
+
+    #[test]
+    fn remainders_floor_never_round_up() {
+        // 40 cols + a bit more than half a cell, 12 rows + most of a row.
+        assert_eq!(grid_for(9.0 * 40.0 + 5.0, 18.0 * 12.0 + 17.0), (40, 12));
+        // A hair under one cell is still nothing: clamped to the 1x1
+        // minimum the protocol requires.
+        assert_eq!(grid_for(8.9, 17.9), (1, 1));
+    }
+
+    #[test]
+    fn tiny_and_degenerate_panes_clamp_to_one_cell() {
+        // Smaller than a cell, exactly zero, or negative (a pane the
+        // layout collapsed): always at least 1x1.
+        assert_eq!(grid_for(0.0, 0.0), (1, 1));
+        assert_eq!(grid_for(-100.0, -100.0), (1, 1));
+        assert_eq!(grid_for(0.5, 0.5), (1, 1));
+    }
+
+    #[test]
+    fn huge_panes_cap_at_the_protocol_maximum() {
+        assert_eq!(grid_for(f32::MAX, f32::MAX), (65535, 65535));
+    }
+
+    #[test]
+    fn a_split_pane_floor_matches_its_pixel_share() {
+        // A 1100x694 window below a 26px header with a 3px gutter, split
+        // 50/50 horizontally: the actor's math, end to end.
+        let gutter = 3.0;
+        let w = 1100.0f32 / 2.0 - gutter;
+        let h = 694.0 - 26.0 - gutter;
+        assert_eq!(grid_for(w, h), (60, 36)); // 547/9 and 665/18, floored
+                                              // One full pane of the same window: 1097/9 and the same height.
+        assert_eq!(grid_for(1100.0 - gutter, h), (121, 36));
+    }
 }

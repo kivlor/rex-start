@@ -4568,6 +4568,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "futures-util",
+ "rex-terminal",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
