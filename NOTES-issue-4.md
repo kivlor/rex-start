@@ -73,3 +73,41 @@ Step 4 will have to **create** it (flagged in the final report).
   layer binding ctrl+alt+* to them, so `init.lua` can rebind them and the
   keymap reports them honestly. Local ctrl-alt-* handling keeps precedence
   (the app handles them before falling through to the terminal path).
+
+## Step 1 — plumbing (commit 6711819)
+
+- `rex-conn`: new `pub fn chunk_utf8(text, max_bytes)` — UTF-8-safe chunker,
+  shared by the app's paste and the example. A character wider than the chunk
+  goes out whole (cutting it would loop forever).
+- `rex-app/src/client.rs`: `ClientCmd::SendKey { key: KeyEvent, prefix }` and
+  `ClientCmd::Paste(String)`; `KeyEvent { key, mods, text, unshifted_codepoint }`
+  builds the `client.key` key object (action=press, composing=false,
+  consumed_mods=""). Actor reads `welcome["limits"]["max_message_bytes"]`
+  (default 64 KiB if absent). `declare_keymap()` runs at startup: declares
+  `app.split` / `app.zoom` / `app.picker` / `app.new_session` (kind client)
+  plus a `default` layer binding ctrl-alt-right/down/z/p/n to them.
+- Decision (in code comment): per-keystroke round trip for typed keys
+  (ordered method + serialized actor ⇒ typed order by construction); paste
+  coalesces one chunk per `client.key` (server accepts multi-char `text`),
+  chunk = max_message_bytes - 1 KiB (floor 1 KiB) so no request can trip the
+  1009 close.
+
+## Step 2 — integration evidence
+
+`crates/rex-conn/examples/client_key.rs` (manual example; a live server can't
+be assumed from `cargo test`). Against the local server it verified, via
+`com.superlogical.terminal.format` (result field `content`, not `text`):
+
+- PASS plain text: multi-char `text` in one call, seen twice (tty echo + cat).
+- PASS multi-KB paste: 84,999 bytes, `REX_KEY_CHUNK_BYTES=8192` → 11 chunks
+  (and 1 chunk with the default limit); end marker `paste-line-04999` on screen.
+- PASS ctrl combo: `key_d`+`ctrl` ends cat; shell runs `echo ctrl-d-worked`.
+- PASS arrow key: at a readline reader (`bash -c 'read -e x; echo GOT:$x'`),
+  two `arrow_left` presses + `X` → `GOT:aXbc`. (In canonical `cat`, arrows are
+  literal bytes — same as a local terminal; earlier live probes show `^[[D`
+  arriving, so delivery itself is fine.)
+- Session created/attached; block_id from `session.view` →
+  `windows[0].focused_block_id`. `client.key` itself needs no block_id (goes
+  to the focused block).
+- Unit tests for `chunk_utf8` in rex-app (3) pass; sessions keytest-*/keyarrow
+  killed after each run.

@@ -17,6 +17,32 @@ use tokio_tungstenite::tungstenite::http::Request;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
+/// Splits `text` into chunks of at most `max_bytes` without breaking a
+/// character: paste text is UTF-8, and a chunk boundary inside a code
+/// point would send invalid bytes to the terminal. Used to keep each
+/// `client.key` request under the welcome's `limits.max_message_bytes`.
+pub fn chunk_utf8<'a>(text: &'a str, max_bytes: usize) -> impl Iterator<Item = &'a str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let mut end = rest.len().min(max_bytes);
+        while end > 0 && !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        // A single character wider than max_bytes still goes out whole:
+        // the caller guarantees max_bytes fits a request, and one code
+        // point never breaks that by much. Cutting it would loop forever.
+        if end == 0 {
+            end = rest.chars().next().map(char::len_utf8).unwrap_or(0);
+        }
+        let (chunk, tail) = rest.split_at(end);
+        rest = tail;
+        Some(chunk)
+    })
+}
+
 pub type Ws = WebSocketStream<UnixStream>;
 
 /// A Sec-WebSocket-Key: 16 random bytes, base64, from /dev/urandom.
