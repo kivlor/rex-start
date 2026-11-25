@@ -1192,6 +1192,27 @@ async fn stream_block(
             _ => continue,
         };
         let fed = replica.feed(&bytes)?;
+        if let Some((cols, rows, cell_w, cell_h)) = fed.resize {
+            // Cross-check, not an assert: the server tells us the cell size
+            // it sized the grid for (0 when unknown). When it's nonzero it
+            // should match what we asked for — a mismatch means our own
+            // request didn't land, or someone else owns the block.
+            if cell_w > 0 && cell_h > 0 {
+                let (want_w, want_h) = (
+                    crate::terminal::CELL_W_PX as u32,
+                    crate::terminal::CELL_H_PX as u32,
+                );
+                if cell_w == want_w && cell_h == want_h {
+                    debug!("block {block_id}: resize {cols}x{rows} at {cell_w}x{cell_h}px matches our cell metrics");
+                } else {
+                    debug!(
+                        "block {block_id}: resize {cols}x{rows} at {cell_w}x{cell_h}px differs from our {want_w}x{want_h}px (someone else owns the grid?)"
+                    );
+                }
+            } else {
+                debug!("block {block_id}: resize {cols}x{rows}, cell px unknown");
+            }
+        }
         if fed.changed {
             if let Some(frame) = replica.frame()? {
                 if first_frame {
