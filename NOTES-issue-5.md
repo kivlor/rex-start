@@ -189,11 +189,17 @@ Cell metrics: terminal.rs's natural (non-stretch) size is 9×18 px per cell
 
 ## Step 2 — grid computation (notes)
 
-`pub fn grid_for(pane_w_px: f32, pane_h_px: f32) -> (u32, u32)` in
-terminal.rs: cols = floor(w / 9), rows = floor(h / 18), each clamped to
-[1, 65535]. Unit tests: exact division, tiny panes → 1×1, remainder floors,
-split-pane fraction math. The resize rex1's nonzero cell px gets a debug
-cross-check log vs 9×18 (no assert).
+`terminal::grid_for(pane_w, pane_h)`: floor(w/9), floor(h/18), clamped to
+[1, 65535]. Tests cover exact division, flooring remainders, sub-cell /
+zero / negative panes → 1x1, the protocol max, and an end-to-end split-pane
+share of a 1100x694 window (547x665 px → 60x36).
+
+Cross-check: `rex_terminal::Fed` now reports the last `resize` rex1 of a
+feed as `(cols, rows, cell_w_px, cell_h_px)`; `stream_block` debug-logs a
+comparison against our 9x18 metrics when the server's cell px is nonzero
+— a match logs "matches our cell metrics", a mismatch logs "someone else
+owns the grid?". Deliberately not a hard assert: cell px can be 0/unknown
+and the owner may be another client.
 
 ## Step 3 — evidence (filled in after live runs)
 

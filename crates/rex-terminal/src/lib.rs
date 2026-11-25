@@ -101,6 +101,10 @@ pub struct Fed {
     pub changed: bool,
     /// The terminal's program exited with this code.
     pub exited: Option<i64>,
+    /// The grid the server reported in a `resize` rex1 this feed, as
+    /// (cols, rows, cell_width_px, cell_height_px). Cell pixels are 0
+    /// when the server doesn't know them. The last one wins.
+    pub resize: Option<(u32, u32, u32, u32)>,
 }
 
 /// A libghostty terminal mirroring one Rex terminal stream.
@@ -347,6 +351,12 @@ fn apply_message(terminal: &mut Terminal, message: RexMessage, fed: &mut Fed) {
                 cell_width_px.max(1),
                 cell_height_px.max(1),
             );
+            fed.resize = Some((
+                u32::from(cols),
+                u32::from(rows),
+                cell_width_px,
+                cell_height_px,
+            ));
         }
         RexMessage::Theme {
             foreground,
