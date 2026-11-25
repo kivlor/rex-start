@@ -516,7 +516,7 @@ impl Actor {
         let margin = 1024;
         let chunk_bytes = (self.max_message_bytes.saturating_sub(margin) as usize).max(1024);
         let mut sent = 0;
-        for chunk in chunk_text(text, chunk_bytes) {
+        for chunk in rex_conn::chunk_utf8(text, chunk_bytes) {
             let key = KeyEvent {
                 key: "unidentified".into(),
                 mods: String::new(),
@@ -880,24 +880,33 @@ async fn stream_block(
     }
     Ok(())
 }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn chunk_utf8_splits_on_char_boundaries() {
+        let text = "\u{e9}abc\u{1f600}def";
+        let chunks: Vec<&str> = rex_conn::chunk_utf8(text, 3).collect();
+        assert_eq!(chunks, vec!["\u{e9}a", "bc", "\u{1f600}", "def"]);
+    }
 
-/// Splits `text` into chunks of at most `max_bytes`, never breaking a
-/// character: paste text is UTF-8, and a chunk boundary inside a code
-/// point would send invalid bytes to the terminal.
-fn chunk_text<'a>(text: &'a str, max_bytes: usize) -> impl Iterator<Item = &'a str> {
-    let mut rest = text;
-    std::iter::from_fn(move || {
-        if rest.is_empty() {
-            return None;
-        }
-        let mut end = rest.len().min(max_bytes);
-        while end > 0 && !rest.is_char_boundary(end) {
-            end -= 1;
-        }
-        let (chunk, tail) = rest.split_at(end);
-        rest = tail;
-        Some(chunk)
-    })
+    #[test]
+    fn chunk_utf8_empty_and_huge() {
+        assert_eq!(rex_conn::chunk_utf8("", 100).count(), 0);
+        let huge = "x".repeat(10_000);
+        assert_eq!(
+            rex_conn::chunk_utf8(&huge, 1024).map(str::len).sum::<usize>(),
+            10_000
+        );
+        assert!(rex_conn::chunk_utf8(&huge, 1024).all(|c| c.len() <= 1024));
+    }
+
+    #[test]
+    fn chunk_utf8_wide_char_in_narrow_chunk() {
+        // A single character wider than the chunk still goes out whole
+        // rather than looping on empty chunks.
+        let chunks: Vec<&str> = rex_conn::chunk_utf8("a\u{1f600}b", 2).collect();
+        assert_eq!(chunks, vec!["a", "\u{1f600}", "b"]);
+    }
 }
 
 #[cfg(test)]
