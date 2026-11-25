@@ -355,6 +355,12 @@ struct Actor {
     /// This client's ID, from `session.bootstrap`. Ownership is exclusive:
     /// it decides which blocks in `owners` are ours.
     my_client_id: String,
+    /// Client ids we held before the current one. A lapse longer than
+    /// the token window makes the server forget the old client, so the
+    /// re-attach gets a NEW id while `owners` still attributes our
+    /// blocks to the old one — those are still ours, and `catch_up`'s
+    /// re-claim must treat them so.
+    former_client_ids: Vec<String>,
     /// Block ID -> owner in the current session, as own_block/disown_block
     /// results and `block_owner_changed` events report it. `None` = no
     /// owner. The view doesn't carry owners, so this map is the truth.
@@ -426,6 +432,7 @@ async fn start_actor(
         max_message_bytes,
         keymap_hash: None,
         my_client_id: String::new(),
+        former_client_ids: Vec::new(),
         owners: HashMap::new(),
         last_grid: HashMap::new(),
     };
@@ -449,7 +456,7 @@ async fn start_actor(
         bootstrap.attached_sessions.len(),
     );
     actor.sessions = bootstrap.attach_all.sessions.clone();
-    actor.my_client_id = bootstrap.client_id.clone().unwrap_or_default();
+    actor.set_client_id(bootstrap.client_id.clone().unwrap_or_default().as_str());
     let first = bootstrap.attached_sessions.first().cloned();
     let _ = actor
         .events
@@ -512,7 +519,14 @@ async fn run(
                     if let Some((session_id, block_id, reply)) = ticket {
                         let result =
                             rex_conn::data_ticket(&mut actor.rpc, &session_id, &block_id).await;
-                        let _ = reply.send(result);
+                        // A dropped reply means the stream task died while
+                        // it waited (e.g. during a long reconnect); the
+                        // ticket is wasted, not lost work. The task's
+                        // `fresh_ticket` treats a dropped oneshot as a
+                        // bail, so nothing hangs on it either way.
+                        if reply.send(result).is_err() {
+                            debug!("ticket reply for {block_id} dropped: stream task gone");
+                        }
                     }
                 }
                 queued = queued_rx.recv() => {
@@ -608,6 +622,52 @@ async fn reconnect_control(
 }
 
 impl Actor {
+    /// Sets the client id, remembering the previous one. A long lapse
+    /// (>60s) hands us a fresh id; blocks recorded under the old id are
+    /// still ours, so keep the old id for `catch_up`'s re-claim filter.
+    fn set_client_id(&mut self, id: &str) {
+        if id != self.my_client_id {
+            if !self.my_client_id.is_empty()
+                && !self
+                    .former_client_ids
+                    .iter()
+                    .any(|old| old == &self.my_client_id)
+            {
+                self.former_client_ids.push(self.my_client_id.clone());
+                debug!("client id changed: {} -> {}", self.my_client_id, id);
+            }
+            self.my_client_id = id.to_owned();
+        }
+    }
+
+    /// Whether an owner id is one of ours: the current client id or any
+    /// former one (a long lapse gives us a new id; blocks the `owners`
+    /// map still lists under the old id are still ours).
+    fn is_our_id(&self, owner: &str) -> bool {
+        owner == self.my_client_id || self.former_client_ids.iter().any(|old| old == owner)
+    }
+
+    /// The blocks `catch_up` should re-claim after a control reconnect:
+    /// those the `owners` map attributes to us — under the current id
+    /// OR a former one, since a >60s lapse hands us a new client id
+    /// while the map still carries the old — and that have a grid to
+    /// re-apply.
+    fn reclaims(
+        owners: &HashMap<String, Option<String>>,
+        last_grid: &HashMap<String, (u32, u32)>,
+        my_client_id: &str,
+        former_client_ids: &[String],
+    ) -> Vec<String> {
+        owners
+            .iter()
+            .filter(|(_, owner)| {
+                owner.as_deref().is_some_and(|owner| {
+                    owner == my_client_id || former_client_ids.iter().any(|old| old == owner)
+                })
+            })
+            .filter_map(|(block, _)| last_grid.get(block).map(|_| block.clone()))
+            .collect()
+    }
     /// A label or short ID becomes a full session ID, via `session.list`.
     async fn resolve_preferred(&mut self, preferred: Option<&str>) -> Result<Option<String>> {
         let Some(target) = preferred else {
@@ -957,7 +1017,8 @@ impl Actor {
         let ours = self
             .owners
             .values()
-            .any(|owner| owner.as_deref() == Some(self.my_client_id.as_str()));
+            .filter_map(|owner| owner.as_deref())
+            .any(|owner| self.is_our_id(owner));
         // Owning nothing means nothing to give up: every path that grants
         // us a block (own_block results, `block_owner_changed`) records
         // it in `owners`, so a non-ours map with stale `last_grid` entries
@@ -1160,40 +1221,55 @@ impl Actor {
         {
             Ok(attached) => {
                 if let Some(id) = attached["client_id"].as_str() {
-                    self.my_client_id = id.to_owned();
+                    // A >60s lapse makes the server forget the old
+                    // client: the re-attach hands us a NEW id. Blocks
+                    // the `owners` map still lists under the old id are
+                    // ours; `reclaims` below treats both ids as ours,
+                    // and the fresh own_block results re-record them
+                    // under the new id.
+                    self.set_client_id(id);
                 }
                 if let Ok(view) = serde_json::from_value::<SessionView>(attached["view"].clone()) {
-                    if view.revision >= current_view.revision {
-                        debug!(
-                            "re-attached: view revision {} (was {})",
-                            view.revision, current_view.revision
-                        );
-                        let _ = self
-                            .events
-                            .send(ClientEvent::View(session_brief.clone(), view.clone()))
-                            .await;
-                        if let Some(c) = &mut self.current {
-                            c.view = view;
-                        }
-                        self.sync_streams().await;
+                    // The re-attach's view IS the truth, whatever its
+                    // revision says: a restarted server starts the
+                    // revision sequence over, so a fresh view can be
+                    // LOWER than the stale one we are showing. The
+                    // revision gates matter only while connected
+                    // (`refresh_view`/event paths keep theirs).
+                    debug!(
+                        "re-attached: view revision {} (was {})",
+                        view.revision, current_view.revision
+                    );
+                    let _ = self
+                        .events
+                        .send(ClientEvent::View(session_brief.clone(), view.clone()))
+                        .await;
+                    if let Some(c) = &mut self.current {
+                        c.view = view;
                     }
+                    self.sync_streams().await;
                 }
             }
             Err(error) => debug!("re-attach failed: {error}"),
         }
-        // Re-claim what the owners map says is still ours, with the grid
-        // we last set. Clearing last_grid first forces the resize back out
-        // (own_block is coalesced).
-        let mine: Vec<(String, (u32, u32))> = self
-            .owners
-            .iter()
-            .filter(|(_, owner)| owner.as_deref() == Some(self.my_client_id.as_str()))
-            .filter_map(|(block, _)| self.last_grid.get(block).map(|g| (block.clone(), *g)))
-            .collect();
-        for (block_id, (cols, rows)) in mine {
-            self.last_grid.remove(&block_id);
-            if let Err(error) = self.own_block(&block_id, cols, rows).await {
-                debug!("re-own {block_id} failed: {error}");
+        // Re-claim what the owners map says is still ours — under the
+        // current id or any former one — with the grid we last set.
+        // Clearing last_grid first forces the resize back out
+        // (own_block is coalesced). After a long lapse the old client
+        // is dead server-side, so its blocks are unowned and a fresh
+        // `own_block` take is legitimate.
+        let mine = Self::reclaims(
+            &self.owners,
+            &self.last_grid,
+            &self.my_client_id,
+            &self.former_client_ids,
+        );
+        for block_id in mine {
+            if let Some(&(cols, rows)) = self.last_grid.get(&block_id) {
+                self.last_grid.remove(&block_id);
+                if let Err(error) = self.own_block(&block_id, cols, rows).await {
+                    debug!("re-own {block_id} failed: {error}");
+                }
             }
         }
     }
@@ -1486,7 +1562,19 @@ async fn stream_block(
                     // replica uses it: every stream byte consumed, across
                     // every connection of the stream, never the WELCOME.
                     resume.consume(bytes.len());
-                    let fed = replica.feed(&bytes)?;
+                    // A decode failure ends the stream — surface it
+                    // instead of dying silently.
+                    let fed = match replica.feed(&bytes) {
+                        Ok(fed) => fed,
+                        Err(error) => {
+                            let _ = events
+                                .send(ClientEvent::Notice(format!(
+                                    "block {block_id}: stream ended: {error}"
+                                )))
+                                .await;
+                            return Err(error.into());
+                        }
+                    };
                     if let Some((cols, rows, cell_w, cell_h)) = fed.resize {
                         // Cross-check, not an assert: the server tells us
                         // the cell size it sized the grid for (0 when
@@ -1681,6 +1769,46 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
+
+    /// The catch_up re-claim set: a >60s lapse gives the re-attach a NEW
+    /// client id while `owners` still maps our blocks to the old one --
+    /// blocks attributed to either id must be re-claimed.
+    #[test]
+    fn reclaims_covers_blocks_owned_under_a_former_client_id() {
+        let mut owners: HashMap<String, Option<String>> = HashMap::new();
+        owners.insert("block:old".into(), Some("client:old".into()));
+        owners.insert("block:new".into(), Some("client:new".into()));
+        owners.insert("block:dead".into(), Some("client:dead".into()));
+        owners.insert("block:free".into(), None);
+        let mut last_grid: HashMap<String, (u32, u32)> = HashMap::new();
+        last_grid.insert("block:old".into(), (80, 24));
+        last_grid.insert("block:new".into(), (80, 24));
+        // `block:nogrid` is ours (old id) but has no grid: nothing to
+        // re-apply. `block:dead`/`block:free` are not ours either way.
+        owners.insert("block:nogrid".into(), Some("client:old".into()));
+
+        let mut mine = Actor::reclaims(
+            &owners,
+            &last_grid,
+            "client:new",
+            &["client:old".to_owned()],
+        );
+        mine.sort();
+        assert_eq!(mine, vec!["block:new".to_owned(), "block:old".to_owned()]);
+    }
+
+    /// The pre-fix behavior was the bug: with no former ids tracked, the
+    /// old-id block is invisible to the re-claim filter.
+    #[test]
+    fn reclaims_without_the_old_id_misses_the_old_blocks() {
+        let mut owners: HashMap<String, Option<String>> = HashMap::new();
+        owners.insert("block:old".into(), Some("client:old".into()));
+        let mut last_grid: HashMap<String, (u32, u32)> = HashMap::new();
+        last_grid.insert("block:old".into(), (80, 24));
+
+        let mine = Actor::reclaims(&owners, &last_grid, "client:new", &[]);
+        assert!(mine.is_empty());
+    }
 
     #[test]
     fn record_owners_sets_and_clears_owners_from_results() {
