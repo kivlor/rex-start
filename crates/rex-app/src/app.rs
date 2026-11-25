@@ -296,6 +296,21 @@ impl RexApp {
                         self.send(ClientCmd::ToggleZoom);
                         return true;
                     }
+                    "p" => {
+                        if self.picker.is_none() {
+                            let selected = self
+                                .session_id
+                                .as_ref()
+                                .and_then(|id| {
+                                    self.sessions.iter().position(|s| &s.session_id == id)
+                                })
+                                .unwrap_or(0);
+                            self.picker = Some(selected);
+                        } else {
+                            self.picker = None;
+                        }
+                        return true;
+                    }
                     "left" | "right" | "up" | "down" => {
                         let direction = match keystroke.key.as_str() {
                             "left" => FocusDirection::Left,
@@ -316,29 +331,10 @@ impl RexApp {
             } else if keystroke.modifiers.control
                 && keystroke.modifiers.alt
                 && !keystroke.modifiers.shift
+                && keystroke.key == "n"
             {
-                match keystroke.key.as_str() {
-                    "p" => {
-                        if self.picker.is_none() {
-                            let selected = self
-                                .session_id
-                                .as_ref()
-                                .and_then(|id| {
-                                    self.sessions.iter().position(|s| &s.session_id == id)
-                                })
-                                .unwrap_or(0);
-                            self.picker = Some(selected);
-                        } else {
-                            self.picker = None;
-                        }
-                        return true;
-                    }
-                    "n" => {
-                        self.send(ClientCmd::NewSession("rex-app".into()));
-                        return true;
-                    }
-                    _ => {}
-                }
+                self.send(ClientCmd::NewSession("rex-app".into()));
+                return true;
             }
         }
         // Paste: gpui 0.2 exposes no paste event, so ctrl+v reads the

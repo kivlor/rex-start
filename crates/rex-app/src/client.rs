@@ -230,7 +230,7 @@ const DEFAULT_LOCAL_KEYS: [&str; 9] = [
     "shift+ctrl+right",
     "shift+ctrl+up",
     "shift+ctrl+down",
-    "ctrl+alt+p",
+    "shift+ctrl+p",
     "ctrl+alt+n",
 ];
 
@@ -876,7 +876,7 @@ impl Actor {
                         {"keys": ["ctrl+shift+right"], "action": "pane.focus.right"},
                         {"keys": ["ctrl+shift+up"], "action": "pane.focus.up"},
                         {"keys": ["ctrl+shift+down"], "action": "pane.focus.down"},
-                        {"keys": ["ctrl+alt+p"], "action": "app.picker"},
+                        {"keys": ["ctrl+shift+p"], "action": "app.picker"},
                         {"keys": ["ctrl+alt+n"], "action": "app.new_session"}
                     ]
                 }
@@ -1965,19 +1965,19 @@ mod tests {
             {"keys": ["ctrl+shift+right"], "action": "pane.focus.right"},
             {"keys": ["ctrl+shift+up"], "action": "pane.focus.up"},
             {"keys": ["ctrl+shift+down"], "action": "pane.focus.down"},
-            {"keys": ["ctrl+alt+p"], "action": "app.picker"},
+            {"keys": ["ctrl+shift+p"], "action": "app.picker"},
             {"keys": ["ctrl+alt+n"], "action": "app.new_session"}
         ]);
         assert_eq!(super::resolved_local_keys(&fresh), default_local_keys());
 
-        // init.lua took over ctrl+alt+p (a Lua binding reports as
+        // init.lua took over ctrl+shift+p (a Lua binding reports as
         // client.key.forward, which always wins), ctrl+alt+n was rebound
         // to another action, ctrl+shift+d starts a sequence, and
         // ctrl+shift+e was removed: only the zoom and focus keys stay
         // ours. A mode binding for shift+ctrl+z must not hide the
         // modeless one.
         let rebound = json!([
-            {"keys": ["ctrl+alt+p"], "action": "client.key.forward", "source": "init.lua:3"},
+            {"keys": ["ctrl+shift+p"], "action": "client.key.forward", "source": "init.lua:3"},
             {"keys": ["shift+ctrl+z"], "action": "pane.zoom"},
             {"keys": ["ctrl+shift+z"], "action": "client.key.forward", "mode": "resize"},
             {"keys": ["ctrl+alt+n"], "action": "dev_layout"},
@@ -1985,7 +1985,7 @@ mod tests {
         ]);
         let rebound: &[serde_json::Value] = rebound.as_array().unwrap();
         assert!(key_is_ours(rebound, "shift+ctrl+z"));
-        assert!(!key_is_ours(rebound, "ctrl+alt+p"));
+        assert!(!key_is_ours(rebound, "shift+ctrl+p"));
         assert!(!key_is_ours(rebound, "ctrl+alt+n"));
         assert!(!key_is_ours(rebound, "shift+ctrl+d"));
         assert!(!key_is_ours(rebound, "shift+ctrl+e"));
@@ -2005,7 +2005,7 @@ mod tests {
     #[test]
     fn default_local_keys_are_the_declared_defaults() {
         assert!(default_local_keys().contains("shift+ctrl+d"));
-        assert!(default_local_keys().contains("ctrl+alt+p"));
+        assert!(default_local_keys().contains("shift+ctrl+p"));
         assert_eq!(default_local_keys().len(), 9);
     }
 

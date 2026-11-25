@@ -10,8 +10,9 @@ memory, translated the way the prior-art Linux client
 (willothy/rex-linux) translates it: `cmd+d` splits right →
 `ctrl+shift+d`, `cmd+shift+d` splits below → `ctrl+shift+e`, zoom →
 `ctrl+shift+z`, and pane focus moves on `ctrl+shift+arrows` (verified
-ungrabbed on this machine). `ctrl+alt+p/n` (picker, new session) never
-conflicted and stay.
+ungrabbed on this machine). The picker moved to `ctrl+shift+p`
+(cmd+shift+p muscle memory, per user request); `ctrl+alt+n` (new
+session) never conflicted and stays.
 
 ## Canonical action names
 

@@ -47,7 +47,7 @@ REX_APP_DEBUG=1 … # protocol/render progress on stderr (frames, view refreshes
 
 Keys: `ctrl-shift-d` split right, `ctrl-shift-e` split below,
 `ctrl-shift-z` zoom/unzoom, `ctrl-shift-arrows` focus the neighboring
-pane, `ctrl-alt-p` session picker (up/down, enter to switch, `n` for a
+pane, `ctrl-shift-p` session picker (up/down, enter to switch, `n` for a
 new session, esc to close), `ctrl-alt-n` new session. The chords match
 the official Mac client's (cmd+d/cmd+shift+d on Linux equivalents), and
 the declared action names are the server's canonical ones
