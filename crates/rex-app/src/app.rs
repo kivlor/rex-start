@@ -159,6 +159,20 @@ impl RexApp {
             ClientEvent::Keymap(ours) => {
                 self.ours = ours;
             }
+            ClientEvent::OwnFailed { block_id, reason } => {
+                // The claim (or its resize) didn't land: forget the cached
+                // request so the next render retries at the current grid
+                // instead of waiting for a grid change or reactivation.
+                self.own_requests.remove(&block_id);
+                self.status = reason;
+            }
+            ClientEvent::BlockReturned(block_id) => {
+                // A foreign owner gave the block back and we're in line:
+                // forget the cached request so the next render re-claims
+                // it at our own fitting grid (the actor has cleared its
+                // last-grid entry, so the resize will go through).
+                self.own_requests.remove(&block_id);
+            }
             ClientEvent::Notice(text) => {
                 self.status = text;
             }
@@ -332,11 +346,9 @@ impl RexApp {
     fn claim_panes(&mut self, window: &mut Window) {
         let viewport = window.viewport_size();
         let (width, height) = (f32::from(viewport.width), f32::from(viewport.height));
-        let area = self.pane_at((width, height), 0.0, 0.0);
         let mut seen: Vec<String> = Vec::new();
         for (block_id, rect) in self.panes() {
-            let pane_w = (rect[2] as f32 * f32::from(area.size.width) - GUTTER).max(1.0);
-            let pane_h = (rect[3] as f32 * f32::from(area.size.height) - GUTTER).max(1.0);
+            let (pane_w, pane_h) = pane_pixels((width, height), rect);
             let grid = grid_for(pane_w, pane_h);
             seen.push(block_id.clone());
             if self.own_requests.get(&block_id) != Some(&grid) {
@@ -357,6 +369,19 @@ impl RexApp {
             gpui::size(px(viewport.0), px(viewport.1 - HEADER)),
         )
     }
+}
+
+/// One pane's pixel size, from the window viewport and the server's rect
+/// fractions: the fraction of the area below the header, minus the
+/// gutter, floored at 1 px. The single source for both the grid the app
+/// claims (claim_panes) and the box it draws (render) — sharing it keeps
+/// the claimed grid and the drawn pane from drifting apart.
+fn pane_pixels(viewport: (f32, f32), rect: [f64; 4]) -> (f32, f32) {
+    let area_h = (viewport.1 - HEADER).max(0.0);
+    (
+        (rect[2] as f32 * viewport.0 - GUTTER).max(1.0),
+        (rect[3] as f32 * area_h - GUTTER).max(1.0),
+    )
 }
 
 impl Render for RexApp {
@@ -411,8 +436,7 @@ impl Render for RexApp {
                 let top = area.origin.y
                     + px(rect[1] as f32 * f32::from(area.size.height))
                     + px(GUTTER / 2.0);
-                let pane_w = (rect[2] as f32 * f32::from(area.size.width) - GUTTER).max(1.0);
-                let pane_h = (rect[3] as f32 * f32::from(area.size.height) - GUTTER).max(1.0);
+                let (pane_w, pane_h) = pane_pixels((width, height), rect);
                 let card = div()
                     .absolute()
                     .left(left)
@@ -727,6 +751,21 @@ mod tests {
             key: key.to_owned(),
             key_char: key_char.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn pane_pixels_matches_the_area_below_the_header_minus_gutter() {
+        // A full-window pane: the whole viewport minus the header, minus
+        // the gutter — the same numbers the claim grid and the drawn box
+        // are both built from.
+        let (w, h) = pane_pixels((1100.0, 720.0), [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!((w, h), (1100.0 - GUTTER, 720.0 - HEADER - GUTTER));
+        // A half-size pane from the server's rect fractions.
+        let (w, h) = pane_pixels((1100.0, 720.0), [0.5, 0.0, 0.5, 1.0]);
+        assert_eq!((w, h), (550.0 - GUTTER, 720.0 - HEADER - GUTTER));
+        // Degenerate fractions never collapse below 1 px.
+        let (w, h) = pane_pixels((10.0, 30.0), [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!((w, h), (1.0, 1.0));
     }
 
     #[test]

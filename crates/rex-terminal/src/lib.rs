@@ -458,6 +458,32 @@ mod tests {
     }
 
     #[test]
+    fn reports_the_grid_a_resize_rex1_carries() {
+        // The resize-rex1 → `Fed::resize` parsing path, as the app's data
+        // stream consumes it: cell pixels flow through, missing fields
+        // default to 0, the last resize of a feed wins, and the terminal
+        // itself clamps to at least 1x1 while `Fed` reports the raw grid.
+        let mut first = snapshot_of(b"", 10, 2);
+        first.extend_from_slice(
+            b"\x1b_rex1;7;{\"type\":\"resize\",\"cols\":40,\"rows\":12,\"cell_width_px\":9,\"cell_height_px\":18}\x1b\\",
+        );
+        let mut second =
+            b"\x1b_rex1;7;{\"type\":\"resize\",\"cols\":80,\"rows\":24}\x1b\\".to_vec();
+        second.extend_from_slice(b"\x1b_rex1;7;{\"type\":\"resize\",\"cols\":0,\"rows\":0}\x1b\\");
+
+        let mut replica = Replica::new(7).unwrap();
+        let fed = replica.feed(&first).unwrap();
+        assert_eq!(fed.resize, Some((40, 12, 9, 18)));
+        let fed = replica.feed(&second).unwrap();
+        // The second feed carried two resizes: the last one wins.
+        assert_eq!(fed.resize, Some((0, 0, 0, 0)));
+        // But the terminal was resized along the way, clamped to 1x1.
+        assert_eq!(replica.size(), Some((1, 1)));
+        // Feeds without a resize report none.
+        assert_eq!(replica.feed(b"x").unwrap().resize, None);
+    }
+
+    #[test]
     fn ignores_a_forged_message_with_the_wrong_nonce() {
         let mut stream = snapshot_of(b"", 10, 2);
         // A program printed a look-alike: wrong nonce, and text around it.
