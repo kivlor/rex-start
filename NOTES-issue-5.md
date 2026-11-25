@@ -320,8 +320,29 @@ files untouched.
 
 ## Step 5 — final checks
 
-(to be recorded)
+- `mise exec -- cargo fmt --all -- --check` — clean.
+- `mise exec -- cargo clippy --workspace --all-targets -- -D warnings` —
+  clean (only the pre-existing proc-macro-error2 future-incompat note
+  from the dependency tree, unrelated to this branch).
+- `mise exec -- cargo test --workspace` — green: 19 (rex-app) + 13
+  (rex-terminal) + 5 (rex-conn) + 1 (probe) = 38 passed, 0 failed.
+- Cleanup: no test sessions remain (`rex ls` empty); no probe-stream-*.bin
+  generated; the two committed fixture .bin files untouched.
 
-## Step 5 — final checks
+## Left for #6
 
-(to be recorded)
+- The graceful-close path (window X → actor's end-of-loop `disown_all`)
+  is wired but not headlessly drivable on this Wayland session: no tool
+  here to click the title bar or drive the WM. A close keybinding or
+  integration hook would let it be exercised end-to-end.
+- Visual htop reflow check under a real WM resize — same blocker; the
+  resize path is wired via render-driven `claim_panes` and reflow was
+  verified programmatically (step 3).
+- Multiple windows of ours on one session: the model tracks one current
+  session and claims its active window's panes; a second window of ours
+  showing the same session would re-own blocks between the two — the API
+  allows only one owner, so a future #6 could coordinate (e.g. only the
+  active window claims).
+- Colors: while a terminal has an owner it takes colors too
+  (`com.superlogical.terminal.set_theme`); ownership plumbing now in place
+  makes that a small follow-up.
